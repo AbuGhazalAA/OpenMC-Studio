@@ -1,8 +1,8 @@
 # OpenMC Studio
 
-> **A modern Integrated Development Environment (IDE) for OpenMC Monte Carlo simulations.**
+> **A modern Integrated Development Environment (IDE) for building, running, and visualizing OpenMC Monte Carlo simulations.**
 
-**OpenMC Studio** is a graphical Integrated Development Environment (IDE) built to simplify reactor physics modeling, radiation transport simulations, shielding analysis, criticality calculations, and result visualization using the **OpenMC** Monte Carlo code.
+**OpenMC Studio** is a graphical Integrated Development Environment (IDE) built to simplify reactor physics modeling, radiation transport simulations, shielding analysis, criticality calculations, and radiation-detector simulation using the **OpenMC** Monte Carlo code. Visualization is central to the tool: geometry, particle behavior, and results are all inspectable directly inside the application rather than through separate external scripts.
 
 Developed by **Dr. Ayman Abu Ghazal**, OpenMC Studio combines an intuitive graphical interface with the flexibility of the OpenMC Python API, allowing users to create, edit, visualize, execute, and analyze OpenMC models within a single application.
 
@@ -21,20 +21,36 @@ Feedback, bug reports, and feature suggestions are highly appreciated.
 
 ## ✨ Features
 
-- Modern graphical user interface (GUI)
-- Integrated Python script editor with syntax highlighting
-- Automatic synchronization between GUI and Python scripts
-- Interactive material editor
-- Geometry builder and visualization tools
-- 2D geometry plotting
-- 3D voxel visualization
+**Materials**
+- Built-in library of common reactor, shielding, and detector materials (water, heavy water, B₄C, lead, stainless steel 304/316, concrete, polyethylene, borated polyethylene, enriched UO₂, HPGe, NaI)
+- Custom material builder — add nuclides or elements by atomic or weight fraction
+
+**Geometry**
+- CSG surface builder (sphere, Z-cylinder, X/Y/Z-plane) with undo history
+- Quick-insert macrobody templates in the Geometry Builder (cylinder, box, sphere, truncated cone)
+
+**Settings & Source**
+- Fixed-source or eigenvalue run mode, with batches/particles/inactive-batch controls
+- Point or volumetric (box) source definitions, with discrete or Watt fission-spectrum energy distributions
+- Photon and electron/positron transport toggles
+- Particle-tracking setup for visual trajectory inspection
+
+**Tallies**
+- Cell, material, energy, and mesh filters
+- Dedicated pulse-height (detector, F8-equivalent) tally mode with Gaussian Energy Broadening (GEB) parameters, purpose-built for HPGe/NaI detector response simulation
+
+**Visualization**
+- 2D geometry plotting with fit-to-geometry and zoom-to-cell navigation
+- GPU-accelerated 3D voxel rendering (PyVista), reflecting the actual script geometry
 - **Real particle-track visualization** — source birth points, interaction/collision events, and trajectories rendered from OpenMC's native tracking output, with per-layer display toggles and animated playback
-- Support for importing and editing legacy MCNP-based models
-- One-click execution of OpenMC simulations
-- Live console output and progress monitoring
-- Automatic statepoint loading
-- Tally extraction and visualization
-- Gaussian Energy Broadening (GEB) calibration for HPGe pulse-height tallies
+- Automatic statepoint loading and tally spectrum visualization with GEB calibration
+
+**Workflow**
+- Integrated Python script editor with syntax highlighting
+- GUI actions across the Materials, Geometry, Settings, and visualization pages generate corresponding Python code directly into the script editor
+- One-click execution of OpenMC simulations with live console output and progress monitoring
+- Nuclear data library manager (cross-section path configuration and isotope explorer)
+- Project save/load (`.omcs` / `.py`), with a full workspace reset on "New Project"
 
 ---
 
@@ -47,7 +63,7 @@ Before running OpenMC Studio, install:
 - HDF5 nuclear data libraries
 - Correctly configured `OPENMC_CROSS_SECTIONS` environment variable
 
-For a known-working set of exact dependency versions, see `requirements.txt`.
+Exact package versions are not pinned in `requirements.txt` -- pip will resolve compatible versions for your Python install automatically.
 
 ---
 
@@ -120,7 +136,7 @@ https://github.com/AymanAbuGhazal/OpenMC-Studio
 
 ## 🤖 Development Note
 
-The core logic, physics models, and architecture of OpenMC Studio were designed and directed by the author. AI assistance (Google Gemini and Claude) was used as a coding tool — to generate, structure, and debug the underlying Python and PySide6 code — under the author's direct oversight throughout development. This is disclosed in the interest of transparency, consistent with growing norms around AI-assisted development in scientific software.
+The architecture, physics logic, and feature design of OpenMC Studio were conceived and directed by the author throughout development. AI coding assistants — Google Gemini Pro and Claude Pro — were used as implementation tools: generating, structuring, and debugging the underlying Python and PySide6 code under that direction. This is noted here in the interest of transparency, consistent with growing norms around AI-assisted development in scientific software.
 
 ---
 
