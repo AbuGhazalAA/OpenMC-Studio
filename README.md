@@ -56,14 +56,27 @@ Feedback, bug reports, and feature suggestions are highly appreciated.
 
 ## 📋 Requirements
 
-Before running OpenMC Studio, install:
+**Before running OpenMC Studio:**
 
 - Python 3.10 or newer
 - OpenMC Python API 0.15.x (tested with 0.15.3)
-- HDF5 nuclear data libraries
-- Correctly configured `OPENMC_CROSS_SECTIONS` environment variable
+- ENDF/B (or equivalent) nuclear data files in HDF5 format, with the `OPENMC_CROSS_SECTIONS` environment variable pointing to their `cross_sections.xml` index — downloaded separately from OpenMC itself; see the [OpenMC data documentation](https://docs.openmc.org/en/stable/usersguide/data.html)
+- A GPU-capable display driver for the 3D Voxel Viewer (PyVista/VTK-based; the rest of the application does not require one)
+
+**Python packages** (installed via `requirements.txt`):
+
+| Package | Used for |
+|---|---|
+| PySide6 | The graphical interface itself |
+| openmc | The simulation engine binding |
+| numpy | Array handling across the geometry, tracks, and voxel pages |
+| matplotlib | 2D geometry rendering and Particle Track overlays |
+| h5py | Reading generated `.h5` voxel plot files (3D Voxel Viewer) |
+| pyvista / pyvistaqt | GPU-accelerated 3D rendering (3D Voxel Viewer) |
 
 Exact package versions are not pinned in `requirements.txt` -- pip will resolve compatible versions for your Python install automatically.
+
+> **Note:** don't confuse the `h5py` *Python package* above (which reads HDF5 files) with the nuclear data *files* themselves, which are also HDF5-formatted but are a separate, much larger download unrelated to `pip install`.
 
 ---
 
