@@ -164,6 +164,9 @@ This project is released under the **MIT License**.
 **Dr. Ayman Abu Ghazal**
 GitHub: https://github.com/AymanAbuGhazal
 
+
+![OpenMC Studio main interface](screenshots/main_window.png)
+![Detector spectrum with GEB calibration](screenshots/results_spectrum.png)
 ---
 
 ## 🤝 Contributing
