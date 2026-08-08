@@ -1,0 +1,18 @@
+{
+    "WATER": {
+        "density": 1.0,
+        "units": "g/cm3",
+        "nuclides": [
+            {
+                "name": "H1",
+                "fraction": 2.0,
+                "type": "ao"
+            },
+            {
+                "name": "O16",
+                "fraction": 1.0,
+                "type": "ao"
+            }
+        ]
+    }
+}
