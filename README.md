@@ -1,37 +1,40 @@
 # OpenMC Studio
 
-**OpenMC Studio** is a dedicated graphical user interface (GUI) and integrated development environment (IDE) designed to streamline reactor physics modeling, radiation shielding simulations, and criticality calculations using the **OpenMC** Monte Carlo engine.
+> **A modern Integrated Development Environment (IDE) for OpenMC Monte Carlo simulations.**
 
-Developed by **Dr. Ayman Abu Ghazal**, OpenMC Studio bridges the gap between Python-based OpenMC scripting and an intuitive visual workflow. It is designed for researchers, students, and nuclear engineers, providing powerful tools for geometry creation, material definition, simulation management, and results analysis.
+**OpenMC Studio** is a graphical Integrated Development Environment (IDE) built to simplify reactor physics modeling, radiation transport simulations, shielding analysis, and criticality calculations using the **OpenMC** Monte Carlo code.
+
+Developed by **Dr. Ayman Abu Ghazal**, OpenMC Studio combines an intuitive graphical interface with the flexibility of the OpenMC Python API, allowing users to create, edit, visualize, execute, and analyze OpenMC models within a single application.
 
 ---
 
-## 🌟 Key Features
+## 🚧 Project Status
 
-- **Python Script Engine**
-  - Full-featured script editor with syntax highlighting.
-  - Real-time synchronization between the GUI and Python scripts.
-  - Safe execution environment.
+> **Beta Release**
 
-- **Geometry & Material Builders**
-  - Interactive creation of materials and compositions.
-  - Visual construction of reactor and shielding geometries.
-  - Support for models translated from legacy MCNP input files.
+OpenMC Studio is currently under active development.
 
-- **Visualization**
-  - Built-in 2D geometry plotting.
-  - Advanced voxel visualization.
-  - Interactive model inspection.
+Core functionality is operational; however, some features are still being refined and expanded. Minor bugs or interface changes may occur between releases.
 
-- **Simulation Management**
-  - Run eigenvalue and fixed-source simulations.
-  - Live output console.
-  - Progress monitoring and estimated completion time.
+Feedback, bug reports, and feature suggestions are highly appreciated.
 
-- **Results & Post-Processing**
-  - Automatic statepoint loading.
-  - Tally extraction and visualization.
-  - Gaussian Energy Broadening (GEB) calibration for HPGe pulse-height simulations.
+---
+
+## ✨ Features
+
+- Modern graphical user interface (GUI)
+- Integrated Python script editor with syntax highlighting
+- Automatic synchronization between GUI and Python scripts
+- Interactive material editor
+- Geometry builder and visualization tools
+- 2D geometry plotting
+- 3D voxel visualization
+- Support for importing and editing legacy MCNP-based models
+- One-click execution of OpenMC simulations
+- Live console output and progress monitoring
+- Automatic statepoint loading
+- Tally extraction and visualization
+- Gaussian Energy Broadening (GEB) calibration for HPGe pulse-height tallies
 
 ---
 
@@ -40,32 +43,33 @@ Developed by **Dr. Ayman Abu Ghazal**, OpenMC Studio bridges the gap between Pyt
 Before running OpenMC Studio, install:
 
 - Python 3.10 or newer
-- OpenMC Python API 0.14.0 or newer
-- HDF5 nuclear data libraries with the `OPENMC_CROSS_SECTIONS` environment variable configured correctly
+- OpenMC Python API 0.14 or newer
+- HDF5 nuclear data libraries
+- Correctly configured `OPENMC_CROSS_SECTIONS` environment variable
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Installation
 
-### Clone the repository
+Clone the repository:
 
 ```
 git clone https://github.com/AymanAbuGhazal/OpenMC-Studio.git
 ```
 
-### Navigate to the project folder
+Go to the project directory:
 
 ```
 cd OpenMC-Studio
 ```
 
-### Install the required packages
+Install the required packages:
 
 ```
 pip install -r requirements.txt
 ```
 
-### Launch the application
+Run the application:
 
 ```
 python main.py
@@ -75,12 +79,15 @@ python main.py
 
 ## 📖 Citation
 
-If you use OpenMC Studio in academic research or technical projects, please cite:
+If you use OpenMC Studio in research or academic publications, please cite:
 
 ```
 Abu Ghazal, A. (2026).
-OpenMC Studio: A Graphical Environment for Monte Carlo Particle Transport Simulations.
-Computer software.
+
+OpenMC Studio: A Modern Integrated Development Environment for OpenMC Monte Carlo Simulations.
+
+Computer Software.
+
 https://github.com/AymanAbuGhazal/OpenMC-Studio
 ```
 
@@ -88,15 +95,23 @@ https://github.com/AymanAbuGhazal/OpenMC-Studio
 
 ## 📄 License
 
-This project is released under the MIT License.
+This project is released under the **MIT License**.
 
 ---
 
-## 📬 Contact
+## 👨‍💻 Developer
 
-**Developer:** Dr. Ayman Abu Ghazal
+**Dr. Ayman Abu Ghazal**
 
-**GitHub:** https://github.com/AymanAbuGhazal
+GitHub: https://github.com/AymanAbuGhazal
+
+---
+
+## 🤝 Contributing
+
+Contributions, bug reports, feature requests, and suggestions are welcome.
+
+If you encounter an issue or have an idea for improving OpenMC Studio, please open an Issue or submit a Pull Request.
 
 ---
 
@@ -104,4 +119,4 @@ This project is released under the MIT License.
 
 OpenMC Studio is an independent open-source project developed by **Dr. Ayman Abu Ghazal**.
 
-It is **not** an official product of the **Jordan Atomic Energy Commission (JAEC)** and does **not** represent the official policies, positions, or endorsements of the JAEC.
+It is **not** an official product of the Jordan Atomic Energy Commission (JAEC) and does **not** represent the official policies, positions, or endorsements of the JAEC.
