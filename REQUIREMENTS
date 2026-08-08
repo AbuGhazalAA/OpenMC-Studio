@@ -1,0 +1,24 @@
+# OpenMC Studio -- core runtime requirements
+#
+# Version RANGES are used deliberately instead of exact pins: this lets
+# pip resolve whatever compatible version fits your own Python install,
+# rather than forcing one exact snapshot tied to one development
+# machine. scipy is NOT listed explicitly -- it is pulled in
+# automatically as one of openmc's own dependencies, so pip resolves a
+# version compatible with your OpenMC and Python versions rather than a
+# version pinned to a Python-3.12-only release.
+#
+# This list was built by directly reviewing the imports in every module
+# in the project (main_window, script_editor, project_tree,
+# property_editor, console_widget, materials_page, material_editor,
+# nuclide_editor, geometry_page, settings_page, tallies_page,
+# libraries_page, plots_page, voxel_page, tracks_page) rather than
+# copied from a pip-freeze snapshot.
+
+PySide6>=6.5
+openmc>=0.15
+numpy>=1.24
+matplotlib>=3.8
+h5py>=3.10
+pyvista>=0.44
+pyvistaqt>=0.11
