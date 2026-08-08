@@ -44,7 +44,8 @@ Feedback, bug reports, and feature suggestions are highly appreciated.
 - GPU-accelerated 3D voxel rendering (PyVista), reflecting the actual script geometry
 - **Real particle-track visualization** — source birth points, interaction/collision events, and trajectories rendered from OpenMC's native tracking output, with per-layer display toggles and animated playback
 - Automatic statepoint loading and tally spectrum visualization with GEB calibration
- ![OpenMC Studio main interface](main_window.png)
+  
+ ![OpenMC Studio main interface](User interface.png)
 
 **Workflow**
 - Integrated Python script editor with syntax highlighting
@@ -168,6 +169,7 @@ GitHub: https://github.com/AymanAbuGhazal
 
 ![Detector spectrum with GEB calibration](results_spectrum.png)
 ---
+
 
 ## 🤝 Contributing
 
