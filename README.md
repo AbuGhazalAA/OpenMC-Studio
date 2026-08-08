@@ -176,6 +176,8 @@ GitHub: https://github.com/AymanAbuGhazal
 Contributions, bug reports, feature requests, and suggestions are welcome.
 If you encounter an issue or have an idea for improving OpenMC Studio, please open an Issue or submit a Pull Request.
 
+## Acknowledgments
+Special thanks to Sachin Shet for providing the Windows-compiled binaries of OpenMC (available: https://shetsdp.github.io/blogs/openmc-windows.html), which served as the core engine for this standalone GUI.
 ---
 
 ## ⚠️ Disclaimer
