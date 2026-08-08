@@ -45,7 +45,7 @@ Feedback, bug reports, and feature suggestions are highly appreciated.
 - **Real particle-track visualization** — source birth points, interaction/collision events, and trajectories rendered from OpenMC's native tracking output, with per-layer display toggles and animated playback
 - Automatic statepoint loading and tally spectrum visualization with GEB calibration
   
- ![OpenMC Studio main interface](User interface.png)
+ ![OpenMC Studio main interface](User_interface.png)
 
 **Workflow**
 - Integrated Python script editor with syntax highlighting
