@@ -3,18 +3,31 @@ import glob
 import openmc
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy.optimize import curve_fit
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit, QFormLayout
+    QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
+    QSplitter
 )
 from PySide6.QtCore import Qt
+
+
+def _gaussian(x, amplitude, mu, sigma, baseline):
+    return baseline + amplitude * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
 
 class ResultsPageWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sp = None  # لتخزين كائن الـ StatePoint
+        # Cached from the last "Plot Spectrum + GEB" call, ONLY when it drew
+        # a pulse-height spectrum (peak fitting isn't physically meaningful
+        # for the heating/flux branch) -- consumed by find_and_fit_peaks().
+        self._last_spectrum_keV = None
+        self._last_spectrum_counts = None
         self._init_ui()
 
     def _init_ui(self):
@@ -92,11 +105,56 @@ class ResultsPageWidget(QWidget):
         geb_form.addStretch()
         tally_layout.addLayout(geb_form)
 
-        # جدول عرض البيانات
+        # --- قسم مطابقة القمم (Peak Fitting), يعمل على آخر طيف Pulse-Height مرسوم ---
+        peak_form = QHBoxLayout()
+        peak_form.addWidget(QLabel("<b>Peak Fitting:</b>"))
+
+        peak_form.addWidget(QLabel("Min Prominence (%):"))
+        self.input_prominence = QLineEdit("5.0")
+        self.input_prominence.setFixedWidth(60)
+        self.input_prominence.setToolTip(
+            "A peak must rise at least this % of the spectrum's tallest peak\n"
+            "above its surrounding baseline to be detected. Lower this to\n"
+            "catch smaller peaks; raise it to ignore statistical noise."
+        )
+        peak_form.addWidget(self.input_prominence)
+
+        self.btn_find_peaks = QPushButton("🔎 Find && Fit Peaks")
+        self.btn_find_peaks.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px; font-weight: bold;")
+        self.btn_find_peaks.clicked.connect(self.find_and_fit_peaks)
+        peak_form.addWidget(self.btn_find_peaks)
+
+        peak_form.addStretch()
+        tally_layout.addLayout(peak_form)
+
+        # --- الجدول الخام + الرسم المدمج + جدول القمم، جنبًا إلى جنب ---
+        results_splitter = QSplitter()
+
         self.table_tally = QTableWidget()
         self.table_tally.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table_tally.setStyleSheet("font-weight: normal; font-size: 12px;")
-        tally_layout.addWidget(self.table_tally)
+        results_splitter.addWidget(self.table_tally)
+
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.figure = Figure(figsize=(7, 5))
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas_toolbar = NavigationToolbar2QT(self.canvas, plot_panel)
+        plot_layout.addWidget(self.canvas_toolbar)
+        plot_layout.addWidget(self.canvas)
+
+        self.table_peaks = QTableWidget()
+        self.table_peaks.setColumnCount(4)
+        self.table_peaks.setHorizontalHeaderLabels(["Peak #", "Centroid [keV]", "FWHM [keV]", "Area [counts]"])
+        self.table_peaks.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_peaks.setMaximumHeight(160)
+        plot_layout.addWidget(self.table_peaks)
+
+        results_splitter.addWidget(plot_panel)
+        results_splitter.setSizes([400, 600])
+        tally_layout.addWidget(results_splitter)
 
         layout.addWidget(tally_group)
 
@@ -151,6 +209,9 @@ class ResultsPageWidget(QWidget):
                 self.lbl_keff.setStyleSheet("font-size: 20px; font-weight: bold; color: #555; padding: 20px;")
 
             self.combo_tallies.clear()
+            self._last_spectrum_keV = None
+            self._last_spectrum_counts = None
+            self.table_peaks.setRowCount(0)
             if hasattr(self.sp, 'tallies') and self.sp.tallies:
                 tallies_source = self.sp.tallies.items() if isinstance(self.sp.tallies, dict) else enumerate(
                     self.sp.tallies)
@@ -173,7 +234,7 @@ class ResultsPageWidget(QWidget):
         if tally_id is None:
             return
         try:
-            tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
+            tally = self.sp.tallies[tally_id]
             df = tally.get_pandas_dataframe()
 
             # معالجة الـ MultiIndex لتجنب أخطاء التسلسل والمصفوفات
@@ -208,7 +269,7 @@ class ResultsPageWidget(QWidget):
             QMessageBox.warning(self, "Warning", "No tally data available to export.")
             return
         tally_id = self.combo_tallies.currentData()
-        tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
+        tally = self.sp.tallies[tally_id]
         df = tally.get_pandas_dataframe()
 
         save_path, _ = QFileDialog.getSaveFileName(
@@ -264,7 +325,7 @@ class ResultsPageWidget(QWidget):
             return
 
         try:
-            tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
+            tally = self.sp.tallies[tally_id]
             energy_filter = tally.find_filter(openmc.EnergyFilter)
             if not energy_filter:
                 QMessageBox.warning(self, "Warning",
@@ -275,7 +336,11 @@ class ResultsPageWidget(QWidget):
             midpoints_eV = [(b[0] + b[1]) / 2 for b in energy_filter.bins]
             midpoints_keV = [e / 1000.0 for e in midpoints_eV]  # تحويل من eV إلى keV
 
-            fig, ax1 = plt.subplots(figsize=(9, 5))
+            self.figure.clear()
+            ax1 = self.figure.add_subplot(111)
+            self._last_spectrum_keV = None
+            self._last_spectrum_counts = None
+            self.table_peaks.setRowCount(0)
 
             if 'pulse-height' in tally.scores:
                 raw_values = tally.get_slice(scores=['pulse-height']).mean.flatten()
@@ -293,6 +358,11 @@ class ResultsPageWidget(QWidget):
                 ax1.set_ylabel('Broadened Counts / Bin [per source particle]', color='purple', fontweight='bold')
                 ax1.set_title(f'HPGe Detector Spectrum - Tally {tally_id} (GEB Applied)')
                 ax1.grid(True, which="both", linestyle='--', alpha=0.6)
+
+                # يُتاح لاستخدام "Find && Fit Peaks" مباشرة على هذا الطيف --
+                # غير متاح لفرع heating/flux لأنه ليس طيف قمم فيزيائيًا.
+                self._last_spectrum_keV = np.asarray(midpoints_keV, dtype=float)
+                self._last_spectrum_counts = np.asarray(broadened_values, dtype=float)
             else:
                 heating = tally.get_slice(
                     scores=['heating']).mean.flatten() if 'heating' in tally.scores else np.zeros_like(midpoints_eV)
@@ -312,8 +382,121 @@ class ResultsPageWidget(QWidget):
                 ax1.set_title(f'Detector Spectrum: Tally {tally_id} Analysis')
 
             ax1.set_xlabel('Energy [keV]', fontsize=12, fontweight='bold')
-            plt.tight_layout()
-            plt.show()
+            self.figure.tight_layout()
+            self.canvas.draw()
 
         except Exception as e:
             QMessageBox.critical(self, "Plot Error", f"Failed to generate graph: {str(e)}")
+
+    def _fit_peaks(self, energies_keV, counts, prominence_frac=0.05, window_factor=4.0):
+        """Find local peaks in `counts` and fit each with an independent
+        Gaussian-plus-baseline model in a small window around it.
+        Returns a list of dicts with centroid/fwhm/area, in ascending
+        energy order. Fitting failures for an individual peak are simply
+        skipped (a bad local fit shouldn't discard every other peak)."""
+        energies = np.asarray(energies_keV, dtype=float)
+        counts = np.asarray(counts, dtype=float)
+        if counts.size < 5 or counts.max() <= 0:
+            return []
+
+        prominence = max(prominence_frac * counts.max(), 1e-30)
+        # Minimum bin separation between accepted peaks -- cheap guard
+        # against counting several adjacent noisy bins around one real
+        # feature as separate peaks (a pure amplitude-prominence
+        # threshold alone doesn't enforce that two accepted peaks are
+        # actually distinct features).
+        peak_idx, _ = find_peaks(counts, prominence=prominence, distance=5)
+
+        d = float(np.median(np.diff(energies))) if energies.size > 1 else 1.0
+        n = counts.size
+        results = []
+        for idx in peak_idx:
+            # Crude half-max width estimate (walk outward from the peak)
+            # to seed the Gaussian sigma and pick a sensible fit window.
+            half = counts[idx] / 2.0
+            left = idx
+            while left > 0 and counts[left] > half:
+                left -= 1
+            right = idx
+            while right < n - 1 and counts[right] > half:
+                right += 1
+            sigma0 = max((energies[right] - energies[left]) / 2.3548, d)
+
+            win = max(3, int(window_factor * sigma0 / d))
+            lo = max(0, idx - win)
+            hi = min(n, idx + win + 1)
+            if hi - lo < 4:
+                continue
+            xw = energies[lo:hi]
+            yw = counts[lo:hi]
+            baseline0 = float(np.min(yw))
+            p0 = [max(counts[idx] - baseline0, 1e-30), energies[idx], sigma0, baseline0]
+
+            try:
+                popt, _ = curve_fit(_gaussian, xw, yw, p0=p0, maxfev=5000)
+                amplitude, mu, sigma, baseline = popt
+                sigma = abs(sigma)
+                if sigma <= 0 or not np.isfinite(mu):
+                    continue
+                fwhm = 2.3548 * sigma
+                area = amplitude * sigma * np.sqrt(2.0 * np.pi)
+                results.append(dict(energy=mu, fwhm=fwhm, area=area,
+                                     amplitude=amplitude, sigma=sigma, baseline=baseline))
+            except Exception:
+                continue
+
+        results.sort(key=lambda p: p['energy'])
+        return results
+
+    def find_and_fit_peaks(self):
+        if self._last_spectrum_keV is None or self._last_spectrum_counts is None:
+            QMessageBox.warning(
+                self, "Warning",
+                "Plot a Pulse-Height spectrum first (click 'Plot Spectrum + GEB' on a tally with a "
+                "pulse-height score) -- peak fitting needs a detector spectrum to search."
+            )
+            return
+
+        try:
+            prominence_frac = float(self.input_prominence.text()) / 100.0
+        except ValueError:
+            QMessageBox.critical(self, "Input Error", "Min Prominence must be a number (percent).")
+            return
+
+        peaks = self._fit_peaks(self._last_spectrum_keV, self._last_spectrum_counts,
+                                 prominence_frac=prominence_frac)
+
+        self.table_peaks.setRowCount(len(peaks))
+        for row, pk in enumerate(peaks):
+            for col, val in enumerate((row + 1, pk['energy'], pk['fwhm'], pk['area'])):
+                text = str(val) if col == 0 else f"{val:.5g}"
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table_peaks.setItem(row, col, item)
+
+        if not self.figure.axes:
+            return
+        ax1 = self.figure.axes[0]
+        # Clear any peak markers from a previous fit (identified by the
+        # '_peak_fit' gid tag) before drawing the current set, so repeated
+        # "Find && Fit Peaks" clicks don't stack duplicate overlays.
+        for artist in list(ax1.lines) + list(ax1.texts):
+            if artist.get_gid() == '_peak_fit':
+                artist.remove()
+
+        x_dense_cache = np.linspace(self._last_spectrum_keV.min(), self._last_spectrum_keV.max(), 2000)
+        for pk in peaks:
+            ax1.axvline(pk['energy'], color='black', linestyle=':', linewidth=0.8, alpha=0.7, gid='_peak_fit')
+            fit_curve = _gaussian(x_dense_cache, pk['amplitude'], pk['energy'], pk['sigma'], pk['baseline'])
+            ax1.plot(x_dense_cache, np.where(fit_curve <= 0, 1e-20, fit_curve),
+                      color='black', linewidth=1.0, alpha=0.8, gid='_peak_fit')
+            ax1.annotate(f"{pk['energy']:.1f} keV\nFWHM {pk['fwhm']:.2f}",
+                         xy=(pk['energy'], pk['amplitude'] + pk['baseline']),
+                         xytext=(0, 8), textcoords='offset points',
+                         fontsize=7, ha='center', color='black', gid='_peak_fit')
+
+        self.canvas.draw()
+
+        if not peaks:
+            QMessageBox.information(self, "No Peaks Found",
+                                     "No peaks met the prominence threshold. Try lowering 'Min Prominence (%)'.")
