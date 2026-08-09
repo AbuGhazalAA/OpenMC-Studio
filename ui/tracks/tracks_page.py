@@ -8,7 +8,7 @@ import openmc
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QFormLayout, QSplitter, QSpinBox, QApplication, QCheckBox,
-    QDialog
+    QDialog, QProgressBar
 )
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 from PySide6.QtGui import QPixmap
@@ -320,6 +320,15 @@ class TrackSimulationWorker(QThread):
     an actual simulation, not an instant preview render.
     """
     finished_signal = Signal(bool, str, list)  # success, message, list of frame PNG paths (empty list on failure)
+    # Emitted for every line OpenMC itself prints during the transport
+    # run, as it's printed -- so the Live Output Console shows real
+    # activity WHILE the run is in progress instead of staying silent
+    # until everything finishes and the tracks suddenly appear. This
+    # doesn't make the drawing itself live (OpenMC only writes tracks.h5
+    # once the whole run completes -- there's no incremental track data
+    # to draw mid-run), but it replaces a silent wait with visible proof
+    # the run is actually progressing.
+    log_signal = Signal(str)
 
     def __init__(self, script_code, n_particles, particle_filter,
                  basis, origin, width, pixels, color_by, export_root,
@@ -397,26 +406,40 @@ class TrackSimulationWorker(QThread):
             # configuration error -- retrying a genuine error (e.g.
             # missing cross-section data) would just waste time repeating
             # the same failure three times before reporting it.
+            # Streamed via Popen (not subprocess.run's capture_output,
+            # which only hands back output once the process has fully
+            # exited) so each line OpenMC prints reaches the Live Output
+            # Console the moment it's produced -- see log_signal above.
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             max_attempts = 3
-            run_result = None
+            returncode = None
+            combined_lines = []
             for attempt in range(1, max_attempts + 1):
-                run_result = subprocess.run(
-                    ["openmc"], cwd=track_dir, capture_output=True, text=True,
-                    creationflags=creationflags
+                combined_lines = []
+                if attempt > 1:
+                    self.log_signal.emit(f"[OpenMC Studio] Retrying transport run (attempt {attempt}/{max_attempts})...")
+                process = subprocess.Popen(
+                    ["openmc"], cwd=track_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, creationflags=creationflags
                 )
-                if run_result.returncode == 0:
+                for line in process.stdout:
+                    clean_line = line.rstrip()
+                    combined_lines.append(clean_line)
+                    self.log_signal.emit(clean_line)
+                process.wait()
+                returncode = process.returncode
+                if returncode == 0:
                     break
-                combined = (run_result.stderr or '') + (run_result.stdout or '')
+                combined = "\n".join(combined_lines)
                 if attempt < max_attempts and _looks_transient_io_error(combined):
                     time.sleep(0.6 * attempt)
                     continue
                 break
 
-            if run_result.returncode != 0:
-                details = (run_result.stderr or run_result.stdout or "(no output captured)").strip()
+            if returncode != 0:
+                details = "\n".join(combined_lines).strip() or "(no output captured)"
                 self.finished_signal.emit(
-                    False, f"Transport run failed (exit code {run_result.returncode}):\n{details}", [])
+                    False, f"Transport run failed (exit code {returncode}):\n{details}", [])
                 return
 
             tracks_h5 = os.path.join(track_dir, "tracks.h5")
@@ -694,6 +717,18 @@ class TracksPageWidget(QWidget):
         self.btn_run.clicked.connect(self.run_tracked_simulation)
         form.addRow(self.btn_run)
 
+        # Indeterminate (busy) bar shown only while the transport run and
+        # background plot are in progress -- OpenMC only writes tracks.h5
+        # once the whole run finishes, so there's no real percentage to
+        # report for a single-batch tracked run; this is visual proof
+        # something is happening rather than a silent wait, alongside the
+        # live-streamed lines now going to the Live Output Console (see
+        # TrackSimulationWorker.log_signal).
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        form.addRow(self.progress_bar)
+
         self.btn_append = QPushButton("\U0001F4BE Append Track Settings to Script")
         self.btn_append.setStyleSheet(
             "background-color: #4a4a4a; color: white; padding: 5px;")
@@ -757,6 +792,7 @@ class TracksPageWidget(QWidget):
 
         self.btn_run.setEnabled(False)
         self.btn_run.setText("\u23f3 Running...")
+        self.progress_bar.setVisible(True)
         # Separate, standalone window (not part of this panel) -- see
         # _RunningNoticeDialog. Kept as an attribute so it isn't
         # garbage-collected while shown, and so _on_tracked_run_finished
@@ -774,12 +810,14 @@ class TracksPageWidget(QWidget):
             show_collisions=self.chk_collisions.isChecked(),
             source_marker_size=self.source_size_spin.value(),
         )
+        self._worker.log_signal.connect(self._log)
         self._worker.finished_signal.connect(self._on_tracked_run_finished)
         self._worker.start()
 
     def _on_tracked_run_finished(self, success, message, frame_paths):
         self.btn_run.setEnabled(True)
         self.btn_run.setText("\U0001F3AF Run Tracked Simulation")
+        self.progress_bar.setVisible(False)
         if hasattr(self, '_running_dialog') and self._running_dialog is not None:
             self._running_dialog.close()
             self._running_dialog = None
