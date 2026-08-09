@@ -15,6 +15,8 @@ from PySide6.QtGui import QPixmap
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgba
 import matplotlib.image as mpimg
 import matplotlib.patheffects as pe
 
@@ -47,14 +49,15 @@ PARTICLE_COLORS = {
     'positron': '#ff7f0e',
 }
 
-# Angle (degrees) between consecutive recorded direction vectors above
-# which a state transition is treated as a genuine interaction (scatter,
-# absorption+reemission, etc.) rather than a plain boundary crossing or
-# numerical noise. Tunable heuristic, not an OpenMC-reported flag -- a
-# boundary crossing alone leaves direction unchanged, so this reliably
-# separates "the particle just passed into the next cell" from "the
-# particle actually interacted with the material here."
-COLLISION_ANGLE_THRESHOLD_DEG = 5.0
+# Interaction (collision) detection uses OpenMC's own recorded cell_id/
+# material_id per state, not a guessed angle threshold: a state transition
+# where BOTH stay the same as the previous state means the particle didn't
+# cross a surface into a new cell -- OpenMC only writes a new state on a
+# real event, so "new state, same cell+material" is definitionally a
+# collision (scatter, absorption+reemission, etc.) rather than a boundary
+# crossing. This replaced an earlier direction-angle-change heuristic,
+# which could both miss small-angle scatters and misfire on accumulated
+# floating-point noise across many boundary crossings.
 
 
 def _neutralize_interactive_plot_methods():
@@ -125,7 +128,7 @@ def _discover_model_objects(script_code):
 
 def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_path,
                      show_tracks=True, show_source=True, show_collisions=True,
-                     source_marker_size=7, reveal_fraction=1.0, dpi=150):
+                     source_marker_size=7, reveal_fraction=1.0, reveal_time=None, dpi=150):
     """Composite the background geometry PNG with real particle-track
     polylines, source-birth markers, and interaction-point markers, all
     aligned in PHYSICAL (cm) coordinates via matplotlib's `extent` -- this
@@ -134,6 +137,22 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
 
     The four show_* flags are independent toggles (any combination,
     including all four or just one), matching how the UI checkboxes work.
+
+    Track lines are colored by particle type (see PARTICLE_COLORS) but
+    drawn as a LineCollection whose per-segment ALPHA is driven by the
+    real recorded energy (states['E']) relative to that particle's own
+    starting energy -- full energy is fully opaque, and the line fades as
+    the particle loses energy along its path, so energy loss is visible
+    directly on the track itself.
+
+    `reveal_time`, when given (absolute seconds, matching states['time']),
+    truncates each track to only the states recorded at or before that
+    physical time -- used for time-accurate animation playback (see
+    TrackSimulationWorker.run) so two tracks of different real duration
+    reveal proportionally to actual elapsed simulation time rather than
+    their own array-index fraction. `reveal_fraction` (index-based) is
+    kept as a fallback for the rare case where no usable time data exists;
+    reveal_time takes precedence whenever it is not None.
 
     `dpi` is exposed so animation frames (which don't need to be
     razor-sharp -- they're each on screen for a fraction of a second) can
@@ -163,13 +182,20 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
         for track in tracks:
             for i, ptrack in enumerate(track.particle_tracks):
                 r = _xyz_field_to_array(ptrack.states['r'])  # always a plain (N, 3) float array now
-                # For animated playback: only reveal the first
-                # reveal_fraction of this track's recorded states. A
-                # single-state track is unaffected (nothing to truncate);
-                # always keep at least 1 state so it can still register.
-                if reveal_fraction < 1.0 and r.shape[0] > 1:
-                    n_keep = max(1, int(np.ceil(r.shape[0] * reveal_fraction)))
-                    r = r[:n_keep]
+                # For animated playback: only reveal the states recorded
+                # up to a cutoff. Prefer real elapsed TIME (reveal_time)
+                # over array-index fraction whenever available -- see the
+                # docstring above. A single-state track is unaffected
+                # (nothing to truncate); always keep at least 1 state so
+                # it can still register.
+                if r.shape[0] > 1:
+                    if reveal_time is not None:
+                        times = np.atleast_1d(ptrack.states['time']).astype(float)
+                        n_keep = max(1, int(np.searchsorted(times, reveal_time, side='right')))
+                        r = r[:n_keep]
+                    elif reveal_fraction < 1.0:
+                        n_keep = max(1, int(np.ceil(r.shape[0] * reveal_fraction)))
+                        r = r[:n_keep]
                 pname = ptrack.particle.name.lower()
                 color = PARTICLE_COLORS.get(pname, '#888888')
                 label = pname.capitalize() if pname not in seen_particles else None
@@ -192,8 +218,31 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
 
                 if show_tracks:
                     seen_particles.add(pname)
-                    ax.plot(h, v, '-', color=color, linewidth=1.4, alpha=0.95, label=label,
-                            path_effects=[pe.Stroke(linewidth=2.6, foreground='white', alpha=0.85), pe.Normal()])
+                    # Energy-loss gradient: alpha per segment follows this
+                    # particle's OWN energy relative to its starting
+                    # energy (states['E'], eV) -- full energy = opaque,
+                    # fully spent = faint. Falls back to a flat, fully
+                    # opaque line if no positive starting energy is
+                    # recorded (e.g. a build/version without E populated).
+                    energies = np.atleast_1d(ptrack.states['E']).astype(float)[:r.shape[0]]
+                    e0 = energies[0] if energies.size and energies[0] > 0 else 0.0
+                    if e0 > 0:
+                        frac = np.clip(energies / e0, 0.0, 1.0)
+                        seg_frac = (frac[:-1] + frac[1:]) / 2.0
+                        min_alpha = 0.35
+                        seg_alpha = min_alpha + (1.0 - min_alpha) * seg_frac
+                    else:
+                        seg_alpha = np.full(max(0, len(h) - 1), 0.95)
+
+                    points = np.stack([h, v], axis=1).reshape(-1, 1, 2)
+                    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                    seg_colors = np.tile(np.array(to_rgba(color)), (len(segments), 1))
+                    seg_colors[:, 3] = seg_alpha
+
+                    lc = LineCollection(
+                        segments, colors=seg_colors, linewidths=1.6, zorder=3, label=label,
+                        path_effects=[pe.Stroke(linewidth=2.6, foreground='white', alpha=0.6), pe.Normal()])
+                    ax.add_collection(lc)
 
                 # Source-birth marker: only the FIRST particle_track entry
                 # in a Track is the primary (source) particle; the rest
@@ -209,15 +258,18 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
                             label=label if not show_tracks else None,
                             path_effects=[pe.withStroke(linewidth=1.8, foreground='white')])
 
-                # Interaction markers: flag consecutive states where the
-                # direction vector 'u' changes by more than the threshold
-                # angle (see COLLISION_ANGLE_THRESHOLD_DEG docstring above).
+                # Interaction markers: a state is a real collision when its
+                # cell_id AND material_id both match the PREVIOUS state --
+                # meaning this new recorded state happened without crossing
+                # a surface into a different cell (see the module-level
+                # comment above for why that's a reliable, data-grounded
+                # test rather than a guessed angle threshold).
                 if show_collisions:
-                    u = _xyz_field_to_array(ptrack.states['u'])[:r.shape[0]]  # same truncation as r
-                    if u.shape[0] > 2:
-                        dots = np.clip(np.einsum('ij,ij->i', u[:-1], u[1:]), -1.0, 1.0)
-                        angle_change_deg = np.degrees(np.arccos(dots))
-                        hit_idx = np.where(angle_change_deg > COLLISION_ANGLE_THRESHOLD_DEG)[0] + 1
+                    cell_ids = np.atleast_1d(ptrack.states['cell_id'])[:r.shape[0]]
+                    mat_ids = np.atleast_1d(ptrack.states['material_id'])[:r.shape[0]]
+                    if cell_ids.shape[0] > 2:
+                        same_cell = (cell_ids[1:] == cell_ids[:-1]) & (mat_ids[1:] == mat_ids[:-1])
+                        hit_idx = np.where(same_cell)[0] + 1
                         if len(hit_idx) > 0:
                             ax.plot(h[hit_idx], v[hit_idx], '.', color=color,
                                     markersize=5, alpha=0.95, zorder=4,
@@ -465,15 +517,36 @@ class TrackSimulationWorker(QThread):
             else:
                 diag += " No position states recorded at all."
 
-            # Generate a SEQUENCE of frames with increasing reveal_fraction
-            # (1/N .. N/N) instead of one static final image -- the widget
-            # plays these back with a QTimer for an animated "watch the
-            # tracks grow" effect. True live updates DURING the OpenMC run
-            # itself aren't possible here (would need openmc.lib, the
-            # in-process C API -- confirmed broken on this specific
-            # openmc-windows-beta build earlier in this session); this
-            # replay happens right after the (now fast, ~20-particle)
-            # run completes, which is the closest achievable approximation.
+            # Generate a SEQUENCE of frames instead of one static final
+            # image -- the widget plays these back with a QTimer for an
+            # animated "watch the tracks grow" effect. True live updates
+            # DURING the OpenMC run itself aren't possible here (would
+            # need openmc.lib, the in-process C API -- confirmed broken on
+            # this specific openmc-windows-beta build earlier in this
+            # session); this replay happens right after the (now fast,
+            # ~20-particle) run completes, which is the closest achievable
+            # approximation.
+            #
+            # Frames are spaced by real elapsed simulation TIME
+            # (states['time'], seconds), not array-index fraction: t_max
+            # is the latest recorded time across every displayed particle,
+            # and frame i reveals everything up through t_max * i/n_frames.
+            # Since the QTimer below fires each frame at a fixed interval,
+            # this makes the on-screen relative motion between frames
+            # match real relative timing (e.g. a particle that free-streams
+            # a long way between two collisions visibly moves further in
+            # a frame than one that scatters immediately) instead of every
+            # track simply reaching the same fraction of its own length at
+            # the same time regardless of how long it actually took.
+            # Falls back to the previous index-fraction method (reveal_time
+            # left None) if no positive time data is available at all.
+            t_max = 0.0
+            for trk in tracks:
+                for pt in trk.particle_tracks:
+                    times = np.atleast_1d(pt.states['time']).astype(float)
+                    if times.size:
+                        t_max = max(t_max, float(times.max()))
+
             # n_frames halved from an earlier version (12->6), and only
             # the FINAL frame renders at full quality (dpi=150) -- the
             # other 5 are transient (on screen for a fraction of a
@@ -496,6 +569,7 @@ class TrackSimulationWorker(QThread):
                                  show_collisions=self.show_collisions,
                                  source_marker_size=self.source_marker_size,
                                  reveal_fraction=fraction,
+                                 reveal_time=(t_max * fraction) if t_max > 0 else None,
                                  dpi=150 if is_last else 80)
                 frame_paths.append(frame_path)
 
@@ -569,13 +643,22 @@ class TracksPageWidget(QWidget):
         form.addRow("Color By:", self.color_combo)
 
         self.n_particles_spin = QSpinBox()
-        self.n_particles_spin.setRange(1, 200)
+        # Upper bound matches the hard cap this specific OpenMC build
+        # enforces ("Batch or Particle limit exceeded... Max particles =
+        # 10000" -- see TrackSimulationWorker.run for where that was hit).
+        # Values in the low thousands are still a real transport run (not
+        # an instant preview) and each additional particle/secondary is
+        # its own matplotlib LineCollection in the overlay, so very high
+        # counts will visibly slow down both the run and the render step.
+        self.n_particles_spin.setRange(1, 10000)
         self.n_particles_spin.setValue(20)
         self.n_particles_spin.setToolTip(
             "Number of source particles to track (batch 1, generation 1,\n"
             "particles 1..N). Each may spawn secondaries (e.g. Compton\n"
-            "electrons) which are tracked too. Keep this modest -- it's a\n"
-            "real transport run, not an instant preview."
+            "electrons) which are tracked too.\n"
+            "Keep this modest for quick iteration -- it's a real transport\n"
+            "run, not an instant preview, and rendering gets slower with\n"
+            "more tracked histories. 10000 is this OpenMC build's hard cap."
         )
         form.addRow("Particles to Track:", self.n_particles_spin)
 
