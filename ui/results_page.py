@@ -628,7 +628,27 @@ class ResultsPageWidget(QWidget):
                 if amplitude <= 0 or not np.isfinite(amplitude):
                     continue
                 fwhm = 2.3548 * sigma
-                area = amplitude * sigma * np.sqrt(2.0 * np.pi)
+                # Area = SUM of background-subtracted counts across the
+                # fit window, not the continuous Gaussian integral
+                # (amplitude*sigma*sqrt(2*pi)). `counts` is a per-BIN
+                # value (matching how both OpenMC's EnergyFilter tally
+                # mean and MCNP's F8 output are reported -- a per-bin
+                # probability, not a per-keV density), so "total counts
+                # under the peak" is the discrete SUM over bins, not an
+                # energy integral. The Gaussian integral formula silently
+                # treats `amplitude` as a continuous density and would
+                # need dividing by the bin width (d, in keV) to convert
+                # back to a bin sum -- get that wrong (as an earlier
+                # version of this code did) and Area comes out too small
+                # by exactly a factor of 1/d, e.g. ~8.5x for a ~0.12 keV
+                # bin width, which is exactly why FEPE was landing a full
+                # order of magnitude low. Summing directly sidesteps the
+                # unit conversion entirely and matches the validated
+                # reference MCNP F8 analyzer's own methodology (which
+                # also computes peak area as a direct background-
+                # subtracted bin sum, not an analytical fit integral).
+                net_local = np.maximum(yw - baseline, 0.0)
+                area = float(np.sum(net_local))
                 results.append(dict(energy=mu, fwhm=fwhm, area=area,
                                      amplitude=amplitude, sigma=sigma, baseline=baseline))
             except Exception:
