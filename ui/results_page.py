@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
-    QDateEdit, QApplication
+    QApplication
 )
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import Qt
 
 
 def _gaussian(x, amplitude, mu, sigma, baseline):
@@ -50,41 +50,6 @@ NUCLIDE_GAMMA_LINES = {
     'Mn-54':  [(834.848, 0.9998)],
     'Zn-65':  [(1115.539, 0.506)],
 }
-
-# Editable defaults for the Reference Source table: (nuclide, half-life
-# value, half-life unit, reference activity [kBq], activity uncertainty
-# [kBq]) -- pre-filled from the user's certified mixed reference source
-# certificate; the UI table lets these be edited/replaced for a different
-# source without touching code.
-DEFAULT_REFERENCE_SOURCE = [
-    ('Am-241', 432.6, 'y', 2412, 31),
-    ('Cd-109', 461.9, 'd', 10.02, 0.16),
-    ('Ce-139', 137.641, 'd', 1304, 18),
-    ('Co-57', 271.81, 'd', 1182, 15),
-    ('Co-60', 5.2711, 'y', 1496, 27),
-    ('Cs-137', 30.018, 'y', 1180, 17),
-    ('Ba-133', 10.539, 'y', 1092, 19),
-    ('Sr-85', 64.850, 'd', 2790, 50),
-    ('Y-88', 106.63, 'd', 3434, 48),
-    ('Cr-51', 27.704, 'd', 9.89, 0.13),
-    ('Mn-54', 312.19, 'd', 3626, 47),
-    ('Zn-65', 244.01, 'd', 4331, 56),
-]
-
-_HALF_LIFE_UNIT_SECONDS = {'s': 1.0, 'd': 86400.0, 'y': 365.25 * 86400.0}
-
-
-def _half_life_seconds(value, unit):
-    return value * _HALF_LIFE_UNIT_SECONDS.get(unit.strip().lower(), 1.0)
-
-
-def _decayed_activity(a0, half_life_s, dt_seconds):
-    """Radioactive decay law A(t) = A0 * 2^(-t/T_half). dt_seconds may be
-    negative (reference date after the analysis date) -- decay works the
-    same either direction, just growing backwards toward a higher A0."""
-    if half_life_s <= 0:
-        return a0
-    return a0 * 2.0 ** (-dt_seconds / half_life_s)
 
 
 def _identify_nuclide(energy_keV, fwhm_keV, tolerance_factor=3.0, min_tolerance_keV=1.0):
@@ -241,60 +206,29 @@ class ResultsPageWidget(QWidget):
         peak_form.addStretch()
         tally_layout.addLayout(peak_form)
 
-        # --- قسم تحديد النظير + حساب FEPE ورسم منحنى الكفاءة ---
-        ref_group = QGroupBox("🎯 Reference Source -- Nuclide ID + FEPE / Efficiency Curve")
-        ref_layout = QVBoxLayout(ref_group)
+        # --- قسم تحديد النظير + حساب FEPE ---
+        nuclide_form = QHBoxLayout()
+        nuclide_form.addWidget(QLabel("<b>Nuclide ID / FEPE:</b>"))
 
-        date_row = QHBoxLayout()
-        date_row.addWidget(QLabel("Reference (certificate) Date:"))
-        self.ref_date_edit = QDateEdit(calendarPopup=True)
-        self.ref_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.ref_date_edit.setDate(QDate.currentDate())
-        self.ref_date_edit.setToolTip(
-            "The date the reference source's activities below were certified\n"
-            "at (its calibration certificate date). Leave equal to the\n"
-            "Simulation Date if you don't need decay correction."
-        )
-        date_row.addWidget(self.ref_date_edit)
-
-        date_row.addWidget(QLabel("Simulation/Analysis Date:"))
-        self.sim_date_edit = QDateEdit(calendarPopup=True)
-        self.sim_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.sim_date_edit.setDate(QDate.currentDate())
-        date_row.addWidget(self.sim_date_edit)
-        date_row.addStretch()
-        ref_layout.addLayout(date_row)
-
-        self.table_ref_source = QTableWidget()
-        self.table_ref_source.setColumnCount(5)
-        self.table_ref_source.setHorizontalHeaderLabels(
-            ["Nuclide", "Half-life", "Unit (s/d/y)", "Ref. Activity [kBq]", "Uncertainty [kBq]"])
-        self.table_ref_source.setRowCount(len(DEFAULT_REFERENCE_SOURCE))
-        for row, (nuclide, half_life, unit, activity, uncertainty) in enumerate(DEFAULT_REFERENCE_SOURCE):
-            for col, val in enumerate((nuclide, half_life, unit, activity, uncertainty)):
-                self.table_ref_source.setItem(row, col, QTableWidgetItem(str(val)))
-        self.table_ref_source.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_ref_source.setMaximumHeight(160)
-        self.table_ref_source.setToolTip(
-            "Editable: replace with your own certified reference source's\n"
-            "nuclides/half-lives/activities if different from the default."
-        )
-        ref_layout.addWidget(self.table_ref_source)
-
-        ref_btn_row = QHBoxLayout()
         self.btn_identify = QPushButton("🎯 Identify Nuclides")
         self.btn_identify.setStyleSheet("background-color: #2c3e50; color: white; padding: 5px; font-weight: bold;")
         self.btn_identify.clicked.connect(self.identify_nuclides)
-        ref_btn_row.addWidget(self.btn_identify)
+        nuclide_form.addWidget(self.btn_identify)
 
         self.btn_fepe = QPushButton("📊 Calculate FEPE + Plot Efficiency Curve")
         self.btn_fepe.setStyleSheet("background-color: #16a085; color: white; padding: 5px; font-weight: bold;")
+        self.btn_fepe.setToolTip(
+            "Re-reads the CURRENT script's settings.source to get the exact\n"
+            "sampling probability OpenMC used for each source energy line --\n"
+            "FEPE = peak net area / that probability. This works regardless\n"
+            "of how the source was built (uniform per-line, activity-\n"
+            "weighted, etc.) because it uses the real probability the\n"
+            "simulation actually used, not an externally assumed one."
+        )
         self.btn_fepe.clicked.connect(self.calculate_fepe_and_plot)
-        ref_btn_row.addWidget(self.btn_fepe)
-        ref_btn_row.addStretch()
-        ref_layout.addLayout(ref_btn_row)
-
-        tally_layout.addWidget(ref_group)
+        nuclide_form.addWidget(self.btn_fepe)
+        nuclide_form.addStretch()
+        tally_layout.addLayout(nuclide_form)
 
         # جدول عرض البيانات الخام
         self.table_tally = QTableWidget()
@@ -720,17 +654,18 @@ class ResultsPageWidget(QWidget):
             # behavior) draws a near-flat line at that peak's own
             # baseline level all the way across the plot, and with many
             # peaks those overlapping near-flat lines are exactly what
-            # turned the whole spectrum into visual noise.
+            # turned the whole spectrum into visual noise. NO text label
+            # is drawn per peak either, for the same reason -- with
+            # dozens of peaks (routine for a real multi-line spectrum),
+            # per-peak text labels overlap into an unreadable mess long
+            # before the line clutter does. All numeric detail (energy,
+            # FWHM, area, nuclide, FEPE) is in the Peak table instead.
             half_span = max(6.0 * pk['sigma'], 1e-6)
             local_x = np.linspace(pk['energy'] - half_span, pk['energy'] + half_span, 200)
-            ax1.axvline(pk['energy'], color='black', linestyle=':', linewidth=0.8, alpha=0.7, gid='_peak_fit')
+            ax1.axvline(pk['energy'], color='black', linestyle=':', linewidth=0.6, alpha=0.5, gid='_peak_fit')
             fit_curve = _gaussian(local_x, pk['amplitude'], pk['energy'], pk['sigma'], pk['baseline'])
             ax1.plot(local_x, np.where(fit_curve <= 0, 1e-20, fit_curve),
                       color='black', linewidth=1.0, alpha=0.8, gid='_peak_fit')
-            ax1.annotate(f"{pk['energy']:.1f} keV\nFWHM {pk['fwhm']:.2f}",
-                         xy=(pk['energy'], pk['amplitude'] + pk['baseline']),
-                         xytext=(0, 8), textcoords='offset points',
-                         fontsize=7, ha='center', color='black', gid='_peak_fit')
 
         self._current_fig.canvas.draw()
         self._current_fig.show()
@@ -739,31 +674,80 @@ class ResultsPageWidget(QWidget):
             QMessageBox.information(self, "No Peaks Found",
                                      "No peaks met the prominence threshold. Try lowering 'Min Prominence (%)'.")
 
-    def _read_reference_source_table(self):
-        """Parse the editable Reference Source table into
-        {nuclide: (half_life_seconds, reference_activity_kBq)}.
-        Raises ValueError with a user-facing message on bad input."""
-        ref = {}
-        for row in range(self.table_ref_source.rowCount()):
-            nuclide_item = self.table_ref_source.item(row, 0)
-            if nuclide_item is None or not nuclide_item.text().strip():
+    def _extract_source_energy_probs(self):
+        """Re-exec the CURRENT script and read the actual per-line
+        sampling probability straight from settings.source.energy (an
+        openmc.stats.Discrete distribution) -- returns {energy_keV:
+        probability}. This is deliberately NOT reconstructed from
+        external nuclear data (real decay intensities) or source
+        activities: a source built for good Monte Carlo statistics
+        commonly samples each line with EQUAL probability regardless of
+        its true relative intensity (exactly what this app's own example
+        script does -- 18 lines, each at 1/18, independent of the real
+        emission probabilities/activities of the nuclides they belong
+        to). FEPE must be normalized against whatever probability the
+        simulation actually used, not an assumed one, or the "per source
+        particle" tally mean can't be converted back to "per photon
+        emitted at that energy" correctly.
+        Raises ValueError with a user-facing message on failure.
+        """
+        main_win = self.window()
+        if not hasattr(main_win, 'script_editor'):
+            raise ValueError("No script editor found.")
+        code = main_win.script_editor.editor.toPlainText()
+        if not code.strip():
+            raise ValueError("Script is empty.")
+
+        namespace = {'openmc': openmc, 'os': os, '__name__': '__main__'}
+        try:
+            openmc.reset_auto_ids()
+            exec(code, namespace)
+        except Exception as e:
+            raise ValueError(f"Could not execute the script: {e}")
+
+        settings_obj = next((v for v in namespace.values() if isinstance(v, openmc.Settings)), None)
+        if settings_obj is None or getattr(settings_obj, 'source', None) is None:
+            raise ValueError("No 'openmc.Settings' with a 'source' was found in the script.")
+
+        sources = settings_obj.source
+        if not isinstance(sources, (list, tuple)):
+            sources = [sources]
+
+        total_strength = sum((getattr(s, 'strength', None) or 1.0) for s in sources)
+        if total_strength <= 0:
+            total_strength = 1.0
+
+        energy_probs = {}
+        for s in sources:
+            energy_dist = getattr(s, 'energy', None)
+            xs = getattr(energy_dist, 'x', None)
+            ps = getattr(energy_dist, 'p', None)
+            if xs is None or ps is None:
+                continue  # not a discrete distribution (e.g. Watt, Maxwell) -- can't map per-line
+            xs = np.asarray(xs, dtype=float)
+            ps = np.asarray(ps, dtype=float)
+            p_sum = ps.sum()
+            if p_sum <= 0:
                 continue
-            nuclide = nuclide_item.text().strip()
-            try:
-                half_life_val = float(self.table_ref_source.item(row, 1).text())
-                unit = self.table_ref_source.item(row, 2).text().strip()
-                activity = float(self.table_ref_source.item(row, 3).text())
-            except (AttributeError, ValueError):
-                raise ValueError(f"Row {row + 1} ({nuclide}): half-life/activity must be numbers.")
-            ref[nuclide] = (_half_life_seconds(half_life_val, unit), activity)
-        return ref
+            ps = ps / p_sum
+            strength_frac = (getattr(s, 'strength', None) or 1.0) / total_strength
+            for x_eV, p in zip(xs, ps):
+                e_keV = x_eV / 1000.0
+                energy_probs[e_keV] = energy_probs.get(e_keV, 0.0) + p * strength_frac
+
+        if not energy_probs:
+            raise ValueError(
+                "Could not find a discrete source energy distribution (openmc.stats.Discrete) "
+                "in settings.source -- FEPE needs to know the per-line sampling probability, "
+                "which only a discrete multi-line source has."
+            )
+        return energy_probs
 
     def identify_nuclides(self):
         """Match each already-fitted peak's centroid to the nearest known
         gamma line (see NUCLIDE_GAMMA_LINES) and fill the Nuclide column.
-        Does not require the Reference Source table -- that's only needed
-        for the FEPE step, since line energies/intensities are fixed
-        nuclear data independent of any specific source's activity."""
+        Independent of the FEPE step -- this only needs fixed nuclear
+        line-energy data, not anything from the script's source."""
         if not self._last_peaks:
             QMessageBox.warning(self, "Warning", "Run 'Find & Fit Peaks' first.")
             return
@@ -788,21 +772,19 @@ class ResultsPageWidget(QWidget):
         """For every peak already matched to a nuclide (run 'Identify
         Nuclides' first), compute the Full-Energy Peak Efficiency:
 
-            FEPE = peak_net_area / (source_weight_of_that_nuclide * emission_probability_of_that_line)
+            FEPE = peak_net_area / P(that line's energy)
 
         `peak_net_area` is already in units of "counts per source
         particle" (straight from the OpenMC tally mean the spectrum was
-        built from). `source_weight_of_that_nuclide` is that nuclide's
-        share of the TOTAL source activity -- i.e. what fraction of all
-        simulated source particles represent a decay of THIS nuclide --
-        computed from the Reference Source table's activities, decay-
-        corrected from the Reference Date to the Simulation/Analysis
-        Date. This is the standard formula for back-computing per-line,
-        per-nuclide efficiency out of a single combined mixed-source run
-        (rather than one run per nuclide): dividing out both the
-        emission probability AND the nuclide's own share of the mixed
-        source recovers "efficiency per photon actually emitted at that
-        energy", independent of how the source mixture was simulated.
+        built from). `P(energy)` is the probability the script's OWN
+        source distribution assigns to that specific energy line, read
+        directly from settings.source.energy (see
+        _extract_source_energy_probs) -- NOT an externally assumed
+        nuclear intensity or activity weighting, since the source may
+        deliberately sample lines with different probabilities than
+        their real relative emission rates (a common Monte Carlo
+        variance-reduction choice, and exactly what this app's own
+        example script does: 18 lines at a flat 1/18 each).
         """
         if not self._last_peaks:
             QMessageBox.warning(self, "Warning", "Run 'Find & Fit Peaks' first.")
@@ -812,24 +794,13 @@ class ResultsPageWidget(QWidget):
             return
 
         try:
-            ref = self._read_reference_source_table()
+            energy_probs = self._extract_source_energy_probs()
         except ValueError as e:
-            QMessageBox.critical(self, "Reference Source Error", str(e))
-            return
-        if not ref:
-            QMessageBox.critical(self, "Reference Source Error", "Reference Source table is empty.")
+            QMessageBox.critical(self, "Source Error", str(e))
             return
 
-        ref_date = self.ref_date_edit.date().toPython()
-        sim_date = self.sim_date_edit.date().toPython()
-        dt_seconds = (sim_date - ref_date).days * 86400.0
-
-        decayed_activity = {nuclide: _decayed_activity(activity, half_life_s, dt_seconds)
-                             for nuclide, (half_life_s, activity) in ref.items()}
-        total_activity = sum(decayed_activity.values())
-        if total_activity <= 0:
-            QMessageBox.critical(self, "Reference Source Error", "Total decayed activity is zero or negative.")
-            return
+        prob_energies = np.array(sorted(energy_probs.keys()))
+        match_tolerance_keV = 1.0
 
         fepe_points = []  # (energy_keV, fepe, nuclide) for the plot
         for row, pk in enumerate(self._last_peaks):
@@ -837,23 +808,27 @@ class ResultsPageWidget(QWidget):
             fepe_item = QTableWidgetItem("-")
             fepe_item.setFlags(fepe_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if match:
-                nuclide, expected_e, intensity = match
-                activity_i = decayed_activity.get(nuclide)
-                if activity_i is not None and intensity > 0:
-                    weight = activity_i / total_activity
-                    fepe = pk['area'] / (weight * intensity)
-                    pk['fepe'] = fepe
-                    fepe_item.setText(f"{fepe:.4g}")
-                    fepe_points.append((expected_e, fepe, nuclide))
+                nuclide, expected_e, _intensity = match
+                nearest_idx = int(np.argmin(np.abs(prob_energies - expected_e)))
+                nearest_e = prob_energies[nearest_idx]
+                if abs(nearest_e - expected_e) <= match_tolerance_keV:
+                    prob = energy_probs[nearest_e]
+                    if prob > 0:
+                        fepe = pk['area'] / prob
+                        pk['fepe'] = fepe
+                        fepe_item.setText(f"{fepe:.4g}")
+                        fepe_points.append((expected_e, fepe, nuclide))
                 else:
-                    self._log(f"⚠️ Peak at {pk['energy']:.1f} keV matched to '{nuclide}', "
-                               f"but that nuclide isn't in the Reference Source table -- skipped.")
+                    self._log(f"⚠️ Peak at {pk['energy']:.1f} keV matched to '{nuclide}' "
+                               f"({expected_e:.2f} keV), but no source energy line was found "
+                               f"within {match_tolerance_keV} keV of it -- skipped.")
             self.table_peaks.setItem(row, 5, fepe_item)
 
         if not fepe_points:
             QMessageBox.warning(
                 self, "No FEPE Computed",
-                "None of the identified peaks' nuclides are in the Reference Source table."
+                "None of the identified peaks' energies matched a line in the script's source "
+                "distribution closely enough."
             )
             return
 
