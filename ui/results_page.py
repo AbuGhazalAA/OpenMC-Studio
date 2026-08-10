@@ -132,16 +132,19 @@ class ResultsPageWidget(QWidget):
         peak_form.addWidget(QLabel("<b>Peak Fitting:</b>"))
 
         peak_form.addWidget(QLabel("Min Prominence (%):"))
-        self.input_prominence = QLineEdit("20.0")
+        self.input_prominence = QLineEdit("50.0")
         self.input_prominence.setFixedWidth(60)
         self.input_prominence.setToolTip(
             "A peak must rise at least this % ABOVE ITS OWN LOCAL BASELINE\n"
-            "(multiplicative -- e.g. 20% means the peak must reach at least\n"
-            "1.2x its surrounding continuum), NOT relative to the spectrum's\n"
+            "(multiplicative -- e.g. 50% means the peak must reach at least\n"
+            "1.5x its surrounding continuum), NOT relative to the spectrum's\n"
             "global maximum -- real gamma spectra span orders of magnitude,\n"
             "so a global-max-relative threshold misses real peaks sitting on\n"
-            "a lower part of the continuum. Lower this to catch weaker\n"
-            "peaks; raise it to ignore statistical noise bumps."
+            "a lower part of the continuum.\n"
+            "Seeing noise-driven false peaks? Raise this. Missing a real\n"
+            "peak? Lower it -- real photopeaks are usually far more than\n"
+            "50% above their local continuum, so this rarely needs to go\n"
+            "below ~10-20% except on a very noisy (low-statistics) run."
         )
         peak_form.addWidget(self.input_prominence)
 
@@ -405,14 +408,13 @@ class ResultsPageWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Plot Error", f"Failed to generate graph: {str(e)}")
 
-    def _fit_peaks(self, energies_keV, counts, geb_abc, prominence_frac=0.2,
-                   window_factor=5.0, min_significance=5.0):
+    def _fit_peaks(self, energies_keV, counts, geb_abc, prominence_frac=0.5, window_factor=5.0):
         """Find local peaks in `counts` and fit each with an independent
         Gaussian-plus-baseline model in a window sized from the DETECTOR'S
         OWN expected resolution at that energy. Returns a list of dicts
         with centroid/fwhm/area, in ascending energy order. Fitting
-        failures or statistically-insignificant candidates are simply
-        skipped (one bad candidate shouldn't discard every other peak).
+        failures are simply skipped (one bad candidate shouldn't discard
+        every other peak).
 
         Two things that look like small tweaks below are both fixes for
         real failure modes hit while testing this against actual detector
@@ -426,8 +428,11 @@ class ResultsPageWidget(QWidget):
            can completely miss a real, visually obvious photopeak sitting
            on a lower part of the Compton continuum. In log10 space,
            `find_peaks`'s prominence is local by construction, so
-           `prominence_frac=0.2` uniformly means "this peak is at least
-           1.2x its own local baseline" everywhere in the spectrum.
+           `prominence_frac=0.5` uniformly means "this peak is at least
+           1.5x its own local baseline" everywhere in the spectrum,
+           regardless of where that baseline sits or what units the tally
+           values are in (raw counts, or a per-source-particle mean as
+           small as 1e-6 -- both occur in practice).
 
         2. Each candidate's fit window is sized from `_expected_sigma_keV`
            -- the SAME GEB formula that broadened the spectrum in the
@@ -439,13 +444,19 @@ class ResultsPageWidget(QWidget):
            half of the starting value, producing a wildly oversized
            window and a degenerate fit across a huge span. Since the true
            post-broadening width at any energy is already known exactly
-           from (a, b, c), there's no need to guess it.
+           from (a, b, c), there's no need to guess it. curve_fit's
+           `bounds` (sigma constrained to roughly that expected width,
+           mu constrained to the fit window) keep individual fits from
+           diverging without needing a separate statistical model of
+           what counts as "noise" -- which, tried here, turned out to
+           silently reject real narrow peaks whenever a bin's own energy
+           width happened to be coarser than the detector's actual
+           resolution at that energy (an easy thing for a user to hit
+           just from how many energy bins they picked).
 
-        A statistical-significance gate (`min_significance`, in units of
-        sqrt(local baseline) -- an approximate Poisson noise floor) and
-        bounded curve_fit (constraining sigma near its expected value and
-        mu to the fit window) further reject candidates that are just
-        noise fluctuations rather than real peaks.
+        `prominence_frac` is the one knob exposed in the UI -- raise it if
+        real peaks come with too many noise-driven false positives, lower
+        it if real (usually far more prominent) peaks are still missing.
         """
         a, b, c = geb_abc
         energies = np.asarray(energies_keV, dtype=float)
@@ -464,7 +475,12 @@ class ResultsPageWidget(QWidget):
         n = counts.size
         results = []
         for idx in peak_idx:
-            sigma0 = max(_expected_sigma_keV(energies[idx], a, b, c), d)
+            # Deliberately NOT floored at `d` -- a real peak's physical
+            # resolution can legitimately be narrower than one energy
+            # bin (e.g. fine GEB parameters with a coarse bin count),
+            # and forcing sigma0 up to a full bin width in that case
+            # oversizes the window and biases the fit.
+            sigma0 = max(_expected_sigma_keV(energies[idx], a, b, c), d * 0.25)
             win = max(6, int(window_factor * sigma0 / d))
             lo = max(0, idx - win)
             hi = min(n, idx + win + 1)
@@ -474,27 +490,16 @@ class ResultsPageWidget(QWidget):
             yw = counts[lo:hi]
             baseline0 = float(np.min(yw))
             net0 = counts[idx] - baseline0
-            noise_floor0 = np.sqrt(max(baseline0, 1.0))
-            if net0 < min_significance * noise_floor0:
-                continue  # cheap pre-fit reject of an obvious noise bump
 
             p0 = [max(net0, 1e-30), energies[idx], sigma0, baseline0]
-            bounds = ([0, xw.min(), d * 0.3, 0],
-                      [np.inf, xw.max(), sigma0 * 5.0, max(float(yw.max()), 1.0)])
+            bounds = ([0, xw.min(), d * 0.1, 0],
+                      [np.inf, xw.max(), sigma0 * 5.0, max(float(yw.max()), 1e-300)])
             try:
                 popt, _ = curve_fit(_gaussian, xw, yw, p0=p0, bounds=bounds, maxfev=5000)
                 amplitude, mu, sigma, baseline = popt
                 if not (xw.min() <= mu <= xw.max()):
                     continue
-                # A resolution-limited peak can't be narrower than
-                # roughly one native bin -- a fit converging below that
-                # is a degenerate few-point spike, not a resolved peak.
-                if sigma < d:
-                    continue
                 if amplitude <= 0 or not np.isfinite(amplitude):
-                    continue
-                noise_floor = np.sqrt(max(baseline, 1.0))
-                if amplitude < min_significance * noise_floor:
                     continue
                 fwhm = 2.3548 * sigma
                 area = amplitude * sigma * np.sqrt(2.0 * np.pi)
