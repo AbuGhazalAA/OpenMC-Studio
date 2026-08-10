@@ -184,3 +184,5 @@ Special thanks to Sachin Shet for providing the Windows-compiled binaries of Ope
 
 OpenMC Studio is an independent open-source project developed by **Dr. Ayman Abu Ghazal**.
 It is **not** an official product of the Jordan Atomic Energy Commission (JAEC) and does **not** represent the official policies, positions, or endorsements of the JAEC.
+
+* DOI integration setup via Zenodo.
