@@ -272,7 +272,7 @@ class ResultsPageWidget(QWidget):
             self.lbl_file.setText(f"Auto-Loaded: {os.path.basename(latest_file)}")
             self.process_statepoint(latest_file)
         except Exception as e:
-            print(f"Auto-load failed: {e}")
+            self._log(f"⚠️ Auto-load failed: {e}")
 
     def load_statepoint(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -329,7 +329,7 @@ class ResultsPageWidget(QWidget):
                 self.table_tally.setColumnCount(0)
         except Exception as e:
             self.lbl_keff.setText("⚠️ Error loading file")
-            print(f"Error loading StatePoint: {e}")
+            self._log(f"⚠️ Error loading StatePoint: {e}")
 
     def display_tally(self, index):
         if not self.sp or index < 0 or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
@@ -347,34 +347,73 @@ class ResultsPageWidget(QWidget):
             else:
                 df.columns = df.columns.astype(str)
 
-            self.table_tally.setRowCount(df.shape[0])
-            self.table_tally.setColumnCount(df.shape[1])
-            self.table_tally.setHorizontalHeaderLabels(list(df.columns))
+            # This is a PREVIEW table, not the export path (Export to CSV
+            # reads the full tally fresh, independent of this) -- a
+            # fine-binned pulse-height tally can have tens of thousands
+            # of rows (e.g. 16384 energy channels), and nobody reviews
+            # that many rows by eye in a GUI table anyway. Cap what's
+            # actually rendered so this stays fast and responsive; the
+            # full data is always one Export click away.
+            max_preview_rows = 2000
+            truncated = df.shape[0] > max_preview_rows
+            df_preview = df.iloc[:max_preview_rows] if truncated else df
 
-            for row in range(df.shape[0]):
-                for col in range(df.shape[1]):
-                    val = df.iloc[row, col]
-                    if isinstance(val, (np.ndarray, list, tuple)):
-                        val_str = ", ".join(
-                            [f"{v:.5e}" if isinstance(v, (float, np.floating)) else str(v) for v in val])
-                    elif isinstance(val, (float, np.floating)):
-                        val_str = f"{val:.5e}"
-                    else:
-                        val_str = str(val)
+            self.table_tally.setRowCount(df_preview.shape[0])
+            self.table_tally.setColumnCount(df_preview.shape[1])
+            self.table_tally.setHorizontalHeaderLabels(list(df_preview.columns))
 
-                    item = QTableWidgetItem(val_str)
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self.table_tally.setItem(row, col, item)
+            # Rendering thousands of individual QTableWidgetItems is slow
+            # if Qt re-lays-out/repaints after every single setItem call;
+            # disabling updates for the whole bulk fill (a standard Qt
+            # technique) keeps this from stalling the GUI thread visibly.
+            self.table_tally.setUpdatesEnabled(False)
+            try:
+                for row in range(df_preview.shape[0]):
+                    for col in range(df_preview.shape[1]):
+                        val = df_preview.iloc[row, col]
+                        if isinstance(val, (np.ndarray, list, tuple)):
+                            val_str = ", ".join(
+                                [f"{v:.5e}" if isinstance(v, (float, np.floating)) else str(v) for v in val])
+                        elif isinstance(val, (float, np.floating)):
+                            val_str = f"{val:.5e}"
+                        else:
+                            val_str = str(val)
+
+                        item = QTableWidgetItem(val_str)
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        self.table_tally.setItem(row, col, item)
+            finally:
+                self.table_tally.setUpdatesEnabled(True)
+
+            if truncated:
+                self._log(f"ℹ️ Tally preview showing the first {max_preview_rows} of {df.shape[0]} rows "
+                          f"-- use 'Export to CSV' for the complete data.")
         except Exception as e:
-            print(f"Could not display tally data: {e}")
+            self._log(f"⚠️ Could not display tally data: {e}")
 
     def export_to_csv(self):
-        if not self.sp or self.table_tally.rowCount() == 0:
-            QMessageBox.warning(self, "Warning", "No tally data available to export.")
+        # Deliberately independent of table_tally's row count: that
+        # preview table can have thousands of rows for a fine-binned
+        # pulse-height tally (e.g. 16384 energy channels), which is slow
+        # to render into a QTableWidget and can still be mid-render (or
+        # have silently failed on some earlier exception) when the user
+        # clicks Export -- none of which has any bearing on whether the
+        # underlying tally data itself is there to export. The only real
+        # prerequisites are a loaded StatePoint and a selected tally.
+        if not self.sp or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
+            QMessageBox.warning(self, "Warning", "Load a StatePoint file with valid tallies first.")
             return
         tally_id = self.combo_tallies.currentData()
-        tally = self.sp.tallies[tally_id]
-        df = tally.get_pandas_dataframe()
+        if tally_id is None:
+            QMessageBox.warning(self, "Warning", "Select a valid Tally from the dropdown first.")
+            return
+
+        try:
+            tally = self.sp.tallies[tally_id]
+            df = tally.get_pandas_dataframe()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not read tally data: {e}")
+            return
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Save Excel CSV", os.path.join(os.getcwd(), f"Tally_{tally_id}_Results.csv"), "CSV Files (*.csv)"
@@ -831,6 +870,31 @@ class ResultsPageWidget(QWidget):
                 "distribution closely enough."
             )
             return
+
+        # With a noisy/low-statistics run, several DIFFERENT fitted peaks
+        # can independently land within tolerance of the SAME real line
+        # (one genuine, the rest small statistical fluctuations nearby
+        # that happen to also be close enough) -- plotting all of them
+        # produces exactly the "same nuclide appears twice, one point
+        # near zero" artifact. For the CURVE (not the per-peak table,
+        # which still shows every match), keep only the strongest
+        # (largest-area, i.e. largest-FEPE) candidate per (nuclide, line).
+        best_per_line = {}
+        n_duplicates = 0
+        for e, fepe, nuclide in fepe_points:
+            key = (nuclide, round(e, 3))
+            if key not in best_per_line or fepe > best_per_line[key][1]:
+                if key in best_per_line:
+                    n_duplicates += 1
+                best_per_line[key] = (e, fepe, nuclide)
+            else:
+                n_duplicates += 1
+        fepe_points = list(best_per_line.values())
+        if n_duplicates:
+            self._log(f"ℹ️ {n_duplicates} duplicate peak match(es) for the same line were dropped from "
+                       f"the efficiency curve (kept the strongest one each time) -- likely statistical "
+                       f"noise peaks landing near a real line. Consider raising 'Min Prominence (%)' if "
+                       f"this happens a lot.")
 
         fepe_points.sort(key=lambda p: p[0])
         energies = [p[0] for p in fepe_points]
