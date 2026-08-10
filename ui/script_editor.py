@@ -121,6 +121,14 @@ class ScriptEditorWidget(QWidget):
                     _cls = getattr(_omcs_shim_openmc, _cls_name, None)
                     if _cls is not None and hasattr(_cls, 'plot'):
                         _cls.plot = _omcs_safe_plot_stub
+
+                # يُعيد ضبط سجل المعرّفات التلقائية قبل كل exec() -- بدون هذا،
+                # تشغيل هذا الزر أكثر من مرة (أو بعد أي صفحة أخرى نفّذت السكريبت
+                # مسبقاً، مثل Validate Geometry) يترك معرّفات Material/Surface/
+                # Cell القديمة مسجّلة، فتتصادم مع المعرّفات الصريحة الجديدة
+                # ويطبع OpenMC عشرات تحذيرات IDWarning. نفس النمط المستخدم في
+                # كل مسارات exec() الأخرى بالتطبيق (plots_page.py، إلخ).
+                _omcs_shim_openmc.reset_auto_ids()
             except ImportError:
                 pass
 
