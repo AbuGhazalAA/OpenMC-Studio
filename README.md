@@ -1,5 +1,5 @@
-.. image:: https://zenodo.org/badge/1327182363.svg
-  :target: https://doi.org/10.5281/zenodo.21878958
+<a href="https://doi.org/10.5281/zenodo.21878958"><img src="https://zenodo.org/badge/1327182363.svg" alt="DOI"></a>
+
 
 # OpenMC Studio
 
