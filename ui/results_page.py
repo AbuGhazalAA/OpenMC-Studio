@@ -552,11 +552,19 @@ class ResultsPageWidget(QWidget):
             if artist.get_gid() == '_peak_fit':
                 artist.remove()
 
-        x_dense = np.linspace(self._last_spectrum_keV.min(), self._last_spectrum_keV.max(), 2000)
         for pk in peaks:
+            # Each peak's fitted curve is drawn ONLY across its own local
+            # window (+/- 6 sigma), not the full spectrum -- evaluating
+            # _gaussian across the entire x-range instead (the previous
+            # behavior) draws a near-flat line at that peak's own
+            # baseline level all the way across the plot, and with many
+            # peaks those overlapping near-flat lines are exactly what
+            # turned the whole spectrum into visual noise.
+            half_span = max(6.0 * pk['sigma'], 1e-6)
+            local_x = np.linspace(pk['energy'] - half_span, pk['energy'] + half_span, 200)
             ax1.axvline(pk['energy'], color='black', linestyle=':', linewidth=0.8, alpha=0.7, gid='_peak_fit')
-            fit_curve = _gaussian(x_dense, pk['amplitude'], pk['energy'], pk['sigma'], pk['baseline'])
-            ax1.plot(x_dense, np.where(fit_curve <= 0, 1e-20, fit_curve),
+            fit_curve = _gaussian(local_x, pk['amplitude'], pk['energy'], pk['sigma'], pk['baseline'])
+            ax1.plot(local_x, np.where(fit_curve <= 0, 1e-20, fit_curve),
                       color='black', linewidth=1.0, alpha=0.8, gid='_peak_fit')
             ax1.annotate(f"{pk['energy']:.1f} keV\nFWHM {pk['fwhm']:.2f}",
                          xy=(pk['energy'], pk['amplitude'] + pk['baseline']),
