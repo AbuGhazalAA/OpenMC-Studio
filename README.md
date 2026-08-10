@@ -1,4 +1,6 @@
-[![DOI](https://zenodo.org/badge/1327182363.svg)](https://doi.org/10.5281/zenodo.21878958)
+[[![DOI](https://zenodo.org/badge/1327182363.svg)](https://doi.org/10.5281/zenodo.21878958)](https://zenodo.org/badge/1327182363.svg
+) 
+
 # OpenMC Studio
 
 > **A modern Integrated Development Environment (IDE) for building, running, and visualizing OpenMC Monte Carlo simulations.**
