@@ -101,6 +101,37 @@ class ScriptEditorWidget(QWidget):
     def append_code(self, code):
         self.editor.appendPlainText(code)
 
+    def replace_tagged_block(self, tag, code):
+        """Like append_code, but for a page (currently only the Geometry
+        Builder) that re-emits its ENTIRE current state on every single
+        add/delete/undo action rather than one incremental chunk per
+        click. Plain append_code would leave every earlier version of
+        that full block sitting in the script too -- so clicking Undo
+        never actually removed the undone surface/cell from the visible
+        script text, it just appended yet another (correct) block on top
+        of the still-present stale ones.
+
+        Wraps `code` in `# >>> BEGIN {tag} BLOCK <<<` / `# >>> END {tag}
+        BLOCK <<<` markers. If a block with this tag already exists in
+        the script, replaces just that region in place (preserving
+        anything the user typed before/after it, including manual edits
+        to the OTHER pages' blocks); otherwise appends a new tagged block
+        at the end, same as append_code would.
+        """
+        begin_marker = f"# >>> BEGIN {tag} BLOCK <<<"
+        end_marker = f"# >>> END {tag} BLOCK <<<"
+        wrapped = f"{begin_marker}\n{code}\n{end_marker}\n"
+
+        text = self.editor.toPlainText()
+        start = text.find(begin_marker)
+        end = text.find(end_marker)
+        if start != -1 and end != -1 and end > start:
+            end += len(end_marker)
+            new_text = text[:start] + wrapped.rstrip('\n') + text[end:]
+            self.editor.setPlainText(new_text)
+        else:
+            self.editor.appendPlainText(wrapped)
+
     def run_script(self):
         code = self.editor.toPlainText()
         namespace = {}
@@ -129,6 +160,19 @@ class ScriptEditorWidget(QWidget):
                 # ويطبع OpenMC عشرات تحذيرات IDWarning. نفس النمط المستخدم في
                 # كل مسارات exec() الأخرى بالتطبيق (plots_page.py، إلخ).
                 _omcs_shim_openmc.reset_auto_ids()
+                # Every other exec() path in the app (plots_page.py,
+                # voxel_page.py, tracks_page.py, results_page.py) seeds
+                # its namespace with {'openmc': openmc, ...} before
+                # exec()'ing, so a script built purely through the GUI
+                # builders (which never insert an `import openmc` line of
+                # their own -- see materials_page.py/geometry_page.py/etc,
+                # they only emit `openmc.Material(...)`-style calls) still
+                # runs. This path used to be the one exception: `namespace`
+                # started empty, so the SAME GUI-built script that runs
+                # fine everywhere else failed here with "NameError: name
+                # 'openmc' is not defined" the moment it used a bare
+                # `openmc.X` call.
+                namespace['openmc'] = _omcs_shim_openmc
             except ImportError:
                 pass
 

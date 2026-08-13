@@ -3,103 +3,18 @@ import glob
 import openmc
 import pandas as pd
 import numpy as np
-from scipy.signal import find_peaks
-from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
-    QApplication
+    QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit, QFormLayout
 )
 from PySide6.QtCore import Qt
-
-
-def _gaussian(x, amplitude, mu, sigma, baseline):
-    return baseline + amplitude * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
-
-
-def _expected_sigma_keV(energy_keV, a, b, c):
-    """The Gaussian sigma a peak at this energy SHOULD have, straight from
-    the same GEB formula apply_geb_broadening used to smear it -- not an
-    empirical guess. Used to size each peak's fit window."""
-    E_MeV = energy_keV / 1000.0
-    fwhm_MeV = a + b * np.sqrt(np.clip(E_MeV + c * E_MeV ** 2, 0.0, None))
-    return max(fwhm_MeV * 1000.0 / 2.3548, 1e-6)
-
-
-# Gamma-ray energy (keV) and emission probability (intensity per decay of
-# THAT nuclide, not per source particle) for the principal lines of the
-# 12-nuclide mixed reference source this page's Nuclide ID / FEPE tools
-# target (Am-241, Cd-109, Ce-139, Co-57, Co-60, Cs-137, Ba-133, Sr-85,
-# Y-88, Cr-51, Mn-54, Zn-65) -- standard nuclear decay-scheme data, so
-# these are safe to ship as fixed constants (unlike source ACTIVITY, which
-# is specific to one certified source/batch and decays with time -- that
-# lives in the editable Reference Source table in the UI instead).
-NUCLIDE_GAMMA_LINES = {
-    'Am-241': [(59.541, 0.359)],
-    'Cd-109': [(88.034, 0.0366)],
-    'Ce-139': [(165.857, 0.799)],
-    'Co-57':  [(122.061, 0.8560), (136.474, 0.1068)],
-    'Co-60':  [(1173.228, 0.9985), (1332.492, 0.999826)],
-    'Cs-137': [(661.657, 0.851)],
-    'Ba-133': [(53.163, 0.00141), (79.614, 0.0265), (81.0, 0.3406), (160.6, 0.00638),
-               (223.2, 0.00450), (276.4, 0.0716), (302.85, 0.1833), (356.01, 0.6205), (383.85, 0.0894)],
-    'Sr-85':  [(514.0, 0.984)],
-    'Y-88':   [(898.042, 0.937), (1836.063, 0.992)],
-    'Cr-51':  [(320.082, 0.0991)],
-    'Mn-54':  [(834.848, 0.9998)],
-    'Zn-65':  [(1115.539, 0.506)],
-}
-
-
-def _identify_nuclide(energy_keV, fwhm_keV, tolerance_factor=3.0, min_tolerance_keV=1.0):
-    """Match a fitted peak centroid to the nearest known gamma line across
-    ALL nuclides in NUCLIDE_GAMMA_LINES, within a tolerance that scales
-    with the peak's own fitted width (a sharper peak -> a tighter, more
-    confident match window; `min_tolerance_keV` keeps that window sane
-    for very narrow low-energy peaks). Returns (nuclide, expected_energy,
-    intensity) for the closest match within tolerance, or None."""
-    tolerance = max(tolerance_factor * fwhm_keV, min_tolerance_keV)
-    best = None
-    best_diff = None
-    for nuclide, lines in NUCLIDE_GAMMA_LINES.items():
-        for line_energy, intensity in lines:
-            diff = abs(line_energy - energy_keV)
-            if diff <= tolerance and (best_diff is None or diff < best_diff):
-                best = (nuclide, line_energy, intensity)
-                best_diff = diff
-    return best
 
 
 class ResultsPageWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sp = None  # لتخزين كائن الـ StatePoint
-        # Cached from the last "Plot Spectrum + GEB" call, ONLY when it drew
-        # a pulse-height spectrum (peak fitting isn't physically meaningful
-        # for the heating/flux branch) -- consumed by find_and_fit_peaks().
-        self._last_spectrum_keV = None
-        self._last_spectrum_counts = None
-        # The GEB (a, b, c) that PRODUCED _last_spectrum_counts -- used to
-        # size each candidate peak's fit window from the actual expected
-        # resolution at that energy (see _expected_sigma_keV), not a
-        # fragile empirical width guess. Cached at plot time rather than
-        # re-read from the input fields at fit time, since the user may
-        # have edited them in between without re-plotting.
-        self._last_geb_abc = None
-        # The popped-up matplotlib figure/axes from the last spectrum plot
-        # -- kept so "Find & Fit Peaks" can overlay results onto that SAME
-        # window instead of the plot living embedded in the app (users
-        # asked for the standalone window back: it gets more screen space
-        # than any panel inside the app, and matplotlib's own toolbar
-        # already gives free pan/zoom there).
-        self._current_fig = None
-        self._current_ax = None
-        # The peak dicts from the last "Find & Fit Peaks" call (each may
-        # gain a 'nuclide_match' key after "Identify Nuclides" and a
-        # 'fepe' key after "Calculate FEPE") -- kept so those two later
-        # steps don't need to re-fit anything, just annotate this list.
-        self._last_peaks = []
         self._init_ui()
 
     def _init_ui(self):
@@ -177,87 +92,13 @@ class ResultsPageWidget(QWidget):
         geb_form.addStretch()
         tally_layout.addLayout(geb_form)
 
-        # --- قسم مطابقة القمم (Peak Fitting), يعمل على آخر طيف Pulse-Height مرسوم في النافذة المنبثقة ---
-        peak_form = QHBoxLayout()
-        peak_form.addWidget(QLabel("<b>Peak Fitting:</b>"))
-
-        peak_form.addWidget(QLabel("Min Prominence (%):"))
-        self.input_prominence = QLineEdit("50.0")
-        self.input_prominence.setFixedWidth(60)
-        self.input_prominence.setToolTip(
-            "A peak must rise at least this % ABOVE ITS OWN LOCAL BASELINE\n"
-            "(multiplicative -- e.g. 50% means the peak must reach at least\n"
-            "1.5x its surrounding continuum), NOT relative to the spectrum's\n"
-            "global maximum -- real gamma spectra span orders of magnitude,\n"
-            "so a global-max-relative threshold misses real peaks sitting on\n"
-            "a lower part of the continuum.\n"
-            "Seeing noise-driven false peaks? Raise this. Missing a real\n"
-            "peak? Lower it -- real photopeaks are usually far more than\n"
-            "50% above their local continuum, so this rarely needs to go\n"
-            "below ~10-20% except on a very noisy (low-statistics) run."
-        )
-        peak_form.addWidget(self.input_prominence)
-
-        self.btn_find_peaks = QPushButton("🔎 Find && Fit Peaks")
-        self.btn_find_peaks.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px; font-weight: bold;")
-        self.btn_find_peaks.clicked.connect(self.find_and_fit_peaks)
-        peak_form.addWidget(self.btn_find_peaks)
-
-        peak_form.addStretch()
-        tally_layout.addLayout(peak_form)
-
-        # --- قسم تحديد النظير + حساب FEPE ---
-        nuclide_form = QHBoxLayout()
-        nuclide_form.addWidget(QLabel("<b>Nuclide ID / FEPE:</b>"))
-
-        self.btn_identify = QPushButton("🎯 Identify Nuclides")
-        self.btn_identify.setStyleSheet("background-color: #2c3e50; color: white; padding: 5px; font-weight: bold;")
-        self.btn_identify.clicked.connect(self.identify_nuclides)
-        nuclide_form.addWidget(self.btn_identify)
-
-        self.btn_fepe = QPushButton("📊 Calculate FEPE + Plot Efficiency Curve")
-        self.btn_fepe.setStyleSheet("background-color: #16a085; color: white; padding: 5px; font-weight: bold;")
-        self.btn_fepe.setToolTip(
-            "Re-reads the CURRENT script's settings.source to get the exact\n"
-            "sampling probability OpenMC used for each source energy line --\n"
-            "FEPE = peak net area / that probability. This works regardless\n"
-            "of how the source was built (uniform per-line, activity-\n"
-            "weighted, etc.) because it uses the real probability the\n"
-            "simulation actually used, not an externally assumed one."
-        )
-        self.btn_fepe.clicked.connect(self.calculate_fepe_and_plot)
-        nuclide_form.addWidget(self.btn_fepe)
-        nuclide_form.addStretch()
-        tally_layout.addLayout(nuclide_form)
-
-        # جدول عرض البيانات الخام
+        # جدول عرض البيانات
         self.table_tally = QTableWidget()
         self.table_tally.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table_tally.setStyleSheet("font-weight: normal; font-size: 12px;")
         tally_layout.addWidget(self.table_tally)
 
-        # جدول نتائج مطابقة القمم -- صغير أسفل الجدول الخام، الرسم نفسه في نافذة منفصلة
-        self.table_peaks = QTableWidget()
-        self.table_peaks.setColumnCount(6)
-        self.table_peaks.setHorizontalHeaderLabels(
-            ["Peak #", "Centroid [keV]", "FWHM [keV]", "Area [counts]", "Nuclide", "FEPE"])
-        self.table_peaks.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_peaks.setMaximumHeight(160)
-        tally_layout.addWidget(self.table_peaks)
-
         layout.addWidget(tally_group)
-
-    def _log(self, msg):
-        """إرسال ذكي للرسائل إلى نافذة الكونسول أينما كانت -- نفس النمط
-        المستخدم في plots_page.py و tracks_page.py."""
-        try:
-            for widget in QApplication.topLevelWidgets():
-                if hasattr(widget, 'console_widget'):
-                    widget.console_widget.append_log(msg)
-                    return
-        except Exception:
-            pass
-        print(msg)
 
     def auto_load_latest_statepoint(self):
         try:
@@ -272,7 +113,7 @@ class ResultsPageWidget(QWidget):
             self.lbl_file.setText(f"Auto-Loaded: {os.path.basename(latest_file)}")
             self.process_statepoint(latest_file)
         except Exception as e:
-            self._log(f"⚠️ Auto-load failed: {e}")
+            print(f"Auto-load failed: {e}")
 
     def load_statepoint(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -310,12 +151,6 @@ class ResultsPageWidget(QWidget):
                 self.lbl_keff.setStyleSheet("font-size: 20px; font-weight: bold; color: #555; padding: 20px;")
 
             self.combo_tallies.clear()
-            self._last_spectrum_keV = None
-            self._last_spectrum_counts = None
-            self._last_geb_abc = None
-            self._current_fig = None
-            self._current_ax = None
-            self.table_peaks.setRowCount(0)
             if hasattr(self.sp, 'tallies') and self.sp.tallies:
                 tallies_source = self.sp.tallies.items() if isinstance(self.sp.tallies, dict) else enumerate(
                     self.sp.tallies)
@@ -329,7 +164,7 @@ class ResultsPageWidget(QWidget):
                 self.table_tally.setColumnCount(0)
         except Exception as e:
             self.lbl_keff.setText("⚠️ Error loading file")
-            self._log(f"⚠️ Error loading StatePoint: {e}")
+            print(f"Error loading StatePoint: {e}")
 
     def display_tally(self, index):
         if not self.sp or index < 0 or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
@@ -338,7 +173,7 @@ class ResultsPageWidget(QWidget):
         if tally_id is None:
             return
         try:
-            tally = self.sp.tallies[tally_id]
+            tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
             df = tally.get_pandas_dataframe()
 
             # معالجة الـ MultiIndex لتجنب أخطاء التسلسل والمصفوفات
@@ -347,73 +182,34 @@ class ResultsPageWidget(QWidget):
             else:
                 df.columns = df.columns.astype(str)
 
-            # This is a PREVIEW table, not the export path (Export to CSV
-            # reads the full tally fresh, independent of this) -- a
-            # fine-binned pulse-height tally can have tens of thousands
-            # of rows (e.g. 16384 energy channels), and nobody reviews
-            # that many rows by eye in a GUI table anyway. Cap what's
-            # actually rendered so this stays fast and responsive; the
-            # full data is always one Export click away.
-            max_preview_rows = 2000
-            truncated = df.shape[0] > max_preview_rows
-            df_preview = df.iloc[:max_preview_rows] if truncated else df
+            self.table_tally.setRowCount(df.shape[0])
+            self.table_tally.setColumnCount(df.shape[1])
+            self.table_tally.setHorizontalHeaderLabels(list(df.columns))
 
-            self.table_tally.setRowCount(df_preview.shape[0])
-            self.table_tally.setColumnCount(df_preview.shape[1])
-            self.table_tally.setHorizontalHeaderLabels(list(df_preview.columns))
+            for row in range(df.shape[0]):
+                for col in range(df.shape[1]):
+                    val = df.iloc[row, col]
+                    if isinstance(val, (np.ndarray, list, tuple)):
+                        val_str = ", ".join(
+                            [f"{v:.5e}" if isinstance(v, (float, np.floating)) else str(v) for v in val])
+                    elif isinstance(val, (float, np.floating)):
+                        val_str = f"{val:.5e}"
+                    else:
+                        val_str = str(val)
 
-            # Rendering thousands of individual QTableWidgetItems is slow
-            # if Qt re-lays-out/repaints after every single setItem call;
-            # disabling updates for the whole bulk fill (a standard Qt
-            # technique) keeps this from stalling the GUI thread visibly.
-            self.table_tally.setUpdatesEnabled(False)
-            try:
-                for row in range(df_preview.shape[0]):
-                    for col in range(df_preview.shape[1]):
-                        val = df_preview.iloc[row, col]
-                        if isinstance(val, (np.ndarray, list, tuple)):
-                            val_str = ", ".join(
-                                [f"{v:.5e}" if isinstance(v, (float, np.floating)) else str(v) for v in val])
-                        elif isinstance(val, (float, np.floating)):
-                            val_str = f"{val:.5e}"
-                        else:
-                            val_str = str(val)
-
-                        item = QTableWidgetItem(val_str)
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                        self.table_tally.setItem(row, col, item)
-            finally:
-                self.table_tally.setUpdatesEnabled(True)
-
-            if truncated:
-                self._log(f"ℹ️ Tally preview showing the first {max_preview_rows} of {df.shape[0]} rows "
-                          f"-- use 'Export to CSV' for the complete data.")
+                    item = QTableWidgetItem(val_str)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.table_tally.setItem(row, col, item)
         except Exception as e:
-            self._log(f"⚠️ Could not display tally data: {e}")
+            print(f"Could not display tally data: {e}")
 
     def export_to_csv(self):
-        # Deliberately independent of table_tally's row count: that
-        # preview table can have thousands of rows for a fine-binned
-        # pulse-height tally (e.g. 16384 energy channels), which is slow
-        # to render into a QTableWidget and can still be mid-render (or
-        # have silently failed on some earlier exception) when the user
-        # clicks Export -- none of which has any bearing on whether the
-        # underlying tally data itself is there to export. The only real
-        # prerequisites are a loaded StatePoint and a selected tally.
-        if not self.sp or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
-            QMessageBox.warning(self, "Warning", "Load a StatePoint file with valid tallies first.")
+        if not self.sp or self.table_tally.rowCount() == 0:
+            QMessageBox.warning(self, "Warning", "No tally data available to export.")
             return
         tally_id = self.combo_tallies.currentData()
-        if tally_id is None:
-            QMessageBox.warning(self, "Warning", "Select a valid Tally from the dropdown first.")
-            return
-
-        try:
-            tally = self.sp.tallies[tally_id]
-            df = tally.get_pandas_dataframe()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not read tally data: {e}")
-            return
+        tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
+        df = tally.get_pandas_dataframe()
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Save Excel CSV", os.path.join(os.getcwd(), f"Tally_{tally_id}_Results.csv"), "CSV Files (*.csv)"
@@ -468,7 +264,7 @@ class ResultsPageWidget(QWidget):
             return
 
         try:
-            tally = self.sp.tallies[tally_id]
+            tally = self.sp.tallies[tally_id]  # NOTE: was a redundant ternary (both branches identical) -- simplified, no behavior change
             energy_filter = tally.find_filter(openmc.EnergyFilter)
             if not energy_filter:
                 QMessageBox.warning(self, "Warning",
@@ -480,9 +276,6 @@ class ResultsPageWidget(QWidget):
             midpoints_keV = [e / 1000.0 for e in midpoints_eV]  # تحويل من eV إلى keV
 
             fig, ax1 = plt.subplots(figsize=(9, 5))
-            self._last_spectrum_keV = None
-            self._last_spectrum_counts = None
-            self.table_peaks.setRowCount(0)
 
             if 'pulse-height' in tally.scores:
                 raw_values = tally.get_slice(scores=['pulse-height']).mean.flatten()
@@ -500,12 +293,6 @@ class ResultsPageWidget(QWidget):
                 ax1.set_ylabel('Broadened Counts / Bin [per source particle]', color='purple', fontweight='bold')
                 ax1.set_title(f'HPGe Detector Spectrum - Tally {tally_id} (GEB Applied)')
                 ax1.grid(True, which="both", linestyle='--', alpha=0.6)
-
-                # يُتاح لاستخدام "Find && Fit Peaks" مباشرة على هذا الطيف --
-                # غير متاح لفرع heating/flux لأنه ليس طيف قمم فيزيائيًا.
-                self._last_spectrum_keV = np.asarray(midpoints_keV, dtype=float)
-                self._last_spectrum_counts = np.asarray(broadened_values, dtype=float)
-                self._last_geb_abc = (a_val, b_val, c_val)
             else:
                 heating = tally.get_slice(
                     scores=['heating']).mean.flatten() if 'heating' in tally.scores else np.zeros_like(midpoints_eV)
@@ -525,415 +312,8 @@ class ResultsPageWidget(QWidget):
                 ax1.set_title(f'Detector Spectrum: Tally {tally_id} Analysis')
 
             ax1.set_xlabel('Energy [keV]', fontsize=12, fontweight='bold')
-            fig.tight_layout()
-            fig.show()
-
-            self._current_fig = fig
-            self._current_ax = ax1
+            plt.tight_layout()
+            plt.show()
 
         except Exception as e:
             QMessageBox.critical(self, "Plot Error", f"Failed to generate graph: {str(e)}")
-
-    def _fit_peaks(self, energies_keV, counts, geb_abc, prominence_frac=0.5, window_factor=5.0):
-        """Find local peaks in `counts` and fit each with an independent
-        Gaussian-plus-baseline model in a window sized from the DETECTOR'S
-        OWN expected resolution at that energy. Returns a list of dicts
-        with centroid/fwhm/area, in ascending energy order. Fitting
-        failures are simply skipped (one bad candidate shouldn't discard
-        every other peak).
-
-        Two things that look like small tweaks below are both fixes for
-        real failure modes hit while testing this against actual detector
-        spectra, not stylistic choices:
-
-        1. Detection runs in LOG10 space with a MULTIPLICATIVE prominence
-           threshold, not linear counts relative to the spectrum's global
-           maximum. Real gamma spectra span many orders of magnitude
-           (that's why they're always plotted log-scale), so a threshold
-           expressed as "% of the tallest bin anywhere in the spectrum"
-           can completely miss a real, visually obvious photopeak sitting
-           on a lower part of the Compton continuum. In log10 space,
-           `find_peaks`'s prominence is local by construction, so
-           `prominence_frac=0.5` uniformly means "this peak is at least
-           1.5x its own local baseline" everywhere in the spectrum,
-           regardless of where that baseline sits or what units the tally
-           values are in (raw counts, or a per-source-particle mean as
-           small as 1e-6 -- both occur in practice).
-
-        2. Each candidate's fit window is sized from `_expected_sigma_keV`
-           -- the SAME GEB formula that broadened the spectrum in the
-           first place -- rather than an empirical "walk outward from the
-           peak until the count rate drops below half-max" heuristic. On
-           a monotonically-decaying continuum (present in every real
-           spectrum, and especially right at the low-energy end) that
-           walk can travel arbitrarily far before ever dropping below
-           half of the starting value, producing a wildly oversized
-           window and a degenerate fit across a huge span. Since the true
-           post-broadening width at any energy is already known exactly
-           from (a, b, c), there's no need to guess it. curve_fit's
-           `bounds` (sigma constrained to roughly that expected width,
-           mu constrained to the fit window) keep individual fits from
-           diverging without needing a separate statistical model of
-           what counts as "noise" -- which, tried here, turned out to
-           silently reject real narrow peaks whenever a bin's own energy
-           width happened to be coarser than the detector's actual
-           resolution at that energy (an easy thing for a user to hit
-           just from how many energy bins they picked).
-
-        `prominence_frac` is the one knob exposed in the UI -- raise it if
-        real peaks come with too many noise-driven false positives, lower
-        it if real (usually far more prominent) peaks are still missing.
-        """
-        a, b, c = geb_abc
-        energies = np.asarray(energies_keV, dtype=float)
-        counts = np.asarray(counts, dtype=float)
-        if counts.size < 5 or counts.max() <= 0:
-            return []
-
-        log_counts = np.log10(np.clip(counts, 1e-300, None))
-        prominence_db = np.log10(1.0 + max(prominence_frac, 1e-6))
-        # Minimum bin separation between accepted peaks -- cheap guard
-        # against counting several adjacent noisy bins around one real
-        # feature as separate peaks.
-        peak_idx, _ = find_peaks(log_counts, prominence=prominence_db, distance=5)
-
-        d = float(np.median(np.diff(energies))) if energies.size > 1 else 1.0
-        n = counts.size
-        results = []
-        for idx in peak_idx:
-            # Deliberately NOT floored at `d` -- a real peak's physical
-            # resolution can legitimately be narrower than one energy
-            # bin (e.g. fine GEB parameters with a coarse bin count),
-            # and forcing sigma0 up to a full bin width in that case
-            # oversizes the window and biases the fit.
-            sigma0 = max(_expected_sigma_keV(energies[idx], a, b, c), d * 0.25)
-            win = max(6, int(window_factor * sigma0 / d))
-            lo = max(0, idx - win)
-            hi = min(n, idx + win + 1)
-            if hi - lo < 9:
-                continue
-            xw = energies[lo:hi]
-            yw = counts[lo:hi]
-            baseline0 = float(np.min(yw))
-            net0 = counts[idx] - baseline0
-
-            p0 = [max(net0, 1e-30), energies[idx], sigma0, baseline0]
-            bounds = ([0, xw.min(), d * 0.1, 0],
-                      [np.inf, xw.max(), sigma0 * 5.0, max(float(yw.max()), 1e-300)])
-            try:
-                popt, _ = curve_fit(_gaussian, xw, yw, p0=p0, bounds=bounds, maxfev=5000)
-                amplitude, mu, sigma, baseline = popt
-                if not (xw.min() <= mu <= xw.max()):
-                    continue
-                if amplitude <= 0 or not np.isfinite(amplitude):
-                    continue
-                fwhm = 2.3548 * sigma
-                # Area = SUM of background-subtracted counts across the
-                # fit window, not the continuous Gaussian integral
-                # (amplitude*sigma*sqrt(2*pi)). `counts` is a per-BIN
-                # value (matching how both OpenMC's EnergyFilter tally
-                # mean and MCNP's F8 output are reported -- a per-bin
-                # probability, not a per-keV density), so "total counts
-                # under the peak" is the discrete SUM over bins, not an
-                # energy integral. The Gaussian integral formula silently
-                # treats `amplitude` as a continuous density and would
-                # need dividing by the bin width (d, in keV) to convert
-                # back to a bin sum -- get that wrong (as an earlier
-                # version of this code did) and Area comes out too small
-                # by exactly a factor of 1/d, e.g. ~8.5x for a ~0.12 keV
-                # bin width, which is exactly why FEPE was landing a full
-                # order of magnitude low. Summing directly sidesteps the
-                # unit conversion entirely and matches the validated
-                # reference MCNP F8 analyzer's own methodology (which
-                # also computes peak area as a direct background-
-                # subtracted bin sum, not an analytical fit integral).
-                net_local = np.maximum(yw - baseline, 0.0)
-                area = float(np.sum(net_local))
-                results.append(dict(energy=mu, fwhm=fwhm, area=area,
-                                     amplitude=amplitude, sigma=sigma, baseline=baseline))
-            except Exception:
-                continue
-
-        results.sort(key=lambda p: p['energy'])
-        return results
-
-    def find_and_fit_peaks(self):
-        if self._last_spectrum_keV is None or self._last_spectrum_counts is None:
-            QMessageBox.warning(
-                self, "Warning",
-                "Plot a Pulse-Height spectrum first (click 'Plot Spectrum + GEB' on a tally with a "
-                "pulse-height score) -- peak fitting needs a detector spectrum to search."
-            )
-            return
-
-        if self._current_fig is None or not plt.fignum_exists(self._current_fig.number):
-            QMessageBox.warning(
-                self, "Warning",
-                "The spectrum window was closed -- click 'Plot Spectrum + GEB' again first."
-            )
-            return
-
-        try:
-            prominence_frac = float(self.input_prominence.text()) / 100.0
-        except ValueError:
-            QMessageBox.critical(self, "Input Error", "Min Prominence must be a number (percent).")
-            return
-
-        peaks = self._fit_peaks(self._last_spectrum_keV, self._last_spectrum_counts,
-                                 self._last_geb_abc, prominence_frac=prominence_frac)
-        for pk in peaks:
-            pk['nuclide_match'] = None
-            pk['fepe'] = None
-        self._last_peaks = peaks
-
-        self.table_peaks.setRowCount(len(peaks))
-        for row, pk in enumerate(peaks):
-            for col, val in enumerate((row + 1, pk['energy'], pk['fwhm'], pk['area'])):
-                text = str(val) if col == 0 else f"{val:.5g}"
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table_peaks.setItem(row, col, item)
-            for col in (4, 5):
-                item = QTableWidgetItem("-")
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table_peaks.setItem(row, col, item)
-
-        ax1 = self._current_ax
-        # Clear any peak markers from a previous fit (identified by the
-        # '_peak_fit' gid tag) before drawing the current set, so repeated
-        # "Find && Fit Peaks" clicks don't stack duplicate overlays.
-        for artist in list(ax1.lines) + list(ax1.texts):
-            if artist.get_gid() == '_peak_fit':
-                artist.remove()
-
-        for pk in peaks:
-            # Each peak's fitted curve is drawn ONLY across its own local
-            # window (+/- 6 sigma), not the full spectrum -- evaluating
-            # _gaussian across the entire x-range instead (the previous
-            # behavior) draws a near-flat line at that peak's own
-            # baseline level all the way across the plot, and with many
-            # peaks those overlapping near-flat lines are exactly what
-            # turned the whole spectrum into visual noise. NO text label
-            # is drawn per peak either, for the same reason -- with
-            # dozens of peaks (routine for a real multi-line spectrum),
-            # per-peak text labels overlap into an unreadable mess long
-            # before the line clutter does. All numeric detail (energy,
-            # FWHM, area, nuclide, FEPE) is in the Peak table instead.
-            half_span = max(6.0 * pk['sigma'], 1e-6)
-            local_x = np.linspace(pk['energy'] - half_span, pk['energy'] + half_span, 200)
-            ax1.axvline(pk['energy'], color='black', linestyle=':', linewidth=0.6, alpha=0.5, gid='_peak_fit')
-            fit_curve = _gaussian(local_x, pk['amplitude'], pk['energy'], pk['sigma'], pk['baseline'])
-            ax1.plot(local_x, np.where(fit_curve <= 0, 1e-20, fit_curve),
-                      color='black', linewidth=1.0, alpha=0.8, gid='_peak_fit')
-
-        self._current_fig.canvas.draw()
-        self._current_fig.show()
-
-        if not peaks:
-            QMessageBox.information(self, "No Peaks Found",
-                                     "No peaks met the prominence threshold. Try lowering 'Min Prominence (%)'.")
-
-    def _extract_source_energy_probs(self):
-        """Re-exec the CURRENT script and read the actual per-line
-        sampling probability straight from settings.source.energy (an
-        openmc.stats.Discrete distribution) -- returns {energy_keV:
-        probability}. This is deliberately NOT reconstructed from
-        external nuclear data (real decay intensities) or source
-        activities: a source built for good Monte Carlo statistics
-        commonly samples each line with EQUAL probability regardless of
-        its true relative intensity (exactly what this app's own example
-        script does -- 18 lines, each at 1/18, independent of the real
-        emission probabilities/activities of the nuclides they belong
-        to). FEPE must be normalized against whatever probability the
-        simulation actually used, not an assumed one, or the "per source
-        particle" tally mean can't be converted back to "per photon
-        emitted at that energy" correctly.
-        Raises ValueError with a user-facing message on failure.
-        """
-        main_win = self.window()
-        if not hasattr(main_win, 'script_editor'):
-            raise ValueError("No script editor found.")
-        code = main_win.script_editor.editor.toPlainText()
-        if not code.strip():
-            raise ValueError("Script is empty.")
-
-        namespace = {'openmc': openmc, 'os': os, '__name__': '__main__'}
-        try:
-            openmc.reset_auto_ids()
-            exec(code, namespace)
-        except Exception as e:
-            raise ValueError(f"Could not execute the script: {e}")
-
-        settings_obj = next((v for v in namespace.values() if isinstance(v, openmc.Settings)), None)
-        if settings_obj is None or getattr(settings_obj, 'source', None) is None:
-            raise ValueError("No 'openmc.Settings' with a 'source' was found in the script.")
-
-        sources = settings_obj.source
-        if not isinstance(sources, (list, tuple)):
-            sources = [sources]
-
-        total_strength = sum((getattr(s, 'strength', None) or 1.0) for s in sources)
-        if total_strength <= 0:
-            total_strength = 1.0
-
-        energy_probs = {}
-        for s in sources:
-            energy_dist = getattr(s, 'energy', None)
-            xs = getattr(energy_dist, 'x', None)
-            ps = getattr(energy_dist, 'p', None)
-            if xs is None or ps is None:
-                continue  # not a discrete distribution (e.g. Watt, Maxwell) -- can't map per-line
-            xs = np.asarray(xs, dtype=float)
-            ps = np.asarray(ps, dtype=float)
-            p_sum = ps.sum()
-            if p_sum <= 0:
-                continue
-            ps = ps / p_sum
-            strength_frac = (getattr(s, 'strength', None) or 1.0) / total_strength
-            for x_eV, p in zip(xs, ps):
-                e_keV = x_eV / 1000.0
-                energy_probs[e_keV] = energy_probs.get(e_keV, 0.0) + p * strength_frac
-
-        if not energy_probs:
-            raise ValueError(
-                "Could not find a discrete source energy distribution (openmc.stats.Discrete) "
-                "in settings.source -- FEPE needs to know the per-line sampling probability, "
-                "which only a discrete multi-line source has."
-            )
-        return energy_probs
-
-    def identify_nuclides(self):
-        """Match each already-fitted peak's centroid to the nearest known
-        gamma line (see NUCLIDE_GAMMA_LINES) and fill the Nuclide column.
-        Independent of the FEPE step -- this only needs fixed nuclear
-        line-energy data, not anything from the script's source."""
-        if not self._last_peaks:
-            QMessageBox.warning(self, "Warning", "Run 'Find & Fit Peaks' first.")
-            return
-
-        n_matched = 0
-        for row, pk in enumerate(self._last_peaks):
-            match = _identify_nuclide(pk['energy'], pk['fwhm'])
-            pk['nuclide_match'] = match
-            if match:
-                n_matched += 1
-                nuclide, expected_e, _intensity = match
-                text = f"{nuclide} ({expected_e:.2f} keV)"
-            else:
-                text = "unidentified"
-            item = QTableWidgetItem(text)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table_peaks.setItem(row, 4, item)
-
-        self._log(f"✅ Identified {n_matched}/{len(self._last_peaks)} peaks against the reference nuclide library.")
-
-    def calculate_fepe_and_plot(self):
-        """For every peak already matched to a nuclide (run 'Identify
-        Nuclides' first), compute the Full-Energy Peak Efficiency:
-
-            FEPE = peak_net_area / P(that line's energy)
-
-        `peak_net_area` is already in units of "counts per source
-        particle" (straight from the OpenMC tally mean the spectrum was
-        built from). `P(energy)` is the probability the script's OWN
-        source distribution assigns to that specific energy line, read
-        directly from settings.source.energy (see
-        _extract_source_energy_probs) -- NOT an externally assumed
-        nuclear intensity or activity weighting, since the source may
-        deliberately sample lines with different probabilities than
-        their real relative emission rates (a common Monte Carlo
-        variance-reduction choice, and exactly what this app's own
-        example script does: 18 lines at a flat 1/18 each).
-        """
-        if not self._last_peaks:
-            QMessageBox.warning(self, "Warning", "Run 'Find & Fit Peaks' first.")
-            return
-        if not any(pk.get('nuclide_match') for pk in self._last_peaks):
-            QMessageBox.warning(self, "Warning", "Run 'Identify Nuclides' first -- FEPE needs identified peaks.")
-            return
-
-        try:
-            energy_probs = self._extract_source_energy_probs()
-        except ValueError as e:
-            QMessageBox.critical(self, "Source Error", str(e))
-            return
-
-        prob_energies = np.array(sorted(energy_probs.keys()))
-        match_tolerance_keV = 1.0
-
-        fepe_points = []  # (energy_keV, fepe, nuclide) for the plot
-        for row, pk in enumerate(self._last_peaks):
-            match = pk.get('nuclide_match')
-            fepe_item = QTableWidgetItem("-")
-            fepe_item.setFlags(fepe_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if match:
-                nuclide, expected_e, _intensity = match
-                nearest_idx = int(np.argmin(np.abs(prob_energies - expected_e)))
-                nearest_e = prob_energies[nearest_idx]
-                if abs(nearest_e - expected_e) <= match_tolerance_keV:
-                    prob = energy_probs[nearest_e]
-                    if prob > 0:
-                        fepe = pk['area'] / prob
-                        pk['fepe'] = fepe
-                        fepe_item.setText(f"{fepe:.4g}")
-                        fepe_points.append((expected_e, fepe, nuclide))
-                else:
-                    self._log(f"⚠️ Peak at {pk['energy']:.1f} keV matched to '{nuclide}' "
-                               f"({expected_e:.2f} keV), but no source energy line was found "
-                               f"within {match_tolerance_keV} keV of it -- skipped.")
-            self.table_peaks.setItem(row, 5, fepe_item)
-
-        if not fepe_points:
-            QMessageBox.warning(
-                self, "No FEPE Computed",
-                "None of the identified peaks' energies matched a line in the script's source "
-                "distribution closely enough."
-            )
-            return
-
-        # With a noisy/low-statistics run, several DIFFERENT fitted peaks
-        # can independently land within tolerance of the SAME real line
-        # (one genuine, the rest small statistical fluctuations nearby
-        # that happen to also be close enough) -- plotting all of them
-        # produces exactly the "same nuclide appears twice, one point
-        # near zero" artifact. For the CURVE (not the per-peak table,
-        # which still shows every match), keep only the strongest
-        # (largest-area, i.e. largest-FEPE) candidate per (nuclide, line).
-        best_per_line = {}
-        n_duplicates = 0
-        for e, fepe, nuclide in fepe_points:
-            key = (nuclide, round(e, 3))
-            if key not in best_per_line or fepe > best_per_line[key][1]:
-                if key in best_per_line:
-                    n_duplicates += 1
-                best_per_line[key] = (e, fepe, nuclide)
-            else:
-                n_duplicates += 1
-        fepe_points = list(best_per_line.values())
-        if n_duplicates:
-            self._log(f"ℹ️ {n_duplicates} duplicate peak match(es) for the same line were dropped from "
-                       f"the efficiency curve (kept the strongest one each time) -- likely statistical "
-                       f"noise peaks landing near a real line. Consider raising 'Min Prominence (%)' if "
-                       f"this happens a lot.")
-
-        fepe_points.sort(key=lambda p: p[0])
-        energies = [p[0] for p in fepe_points]
-        efficiencies = [p[1] for p in fepe_points]
-        labels = [p[2] for p in fepe_points]
-
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(energies, efficiencies, 'o-', color='#16a085', markersize=6)
-        for e, eff, nuclide in fepe_points:
-            ax.annotate(nuclide, (e, eff), xytext=(0, 7), textcoords='offset points',
-                        fontsize=7, ha='center')
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_xlabel('Energy [keV]', fontsize=11, fontweight='bold')
-        ax.set_ylabel('FEPE (Full-Energy Peak Efficiency)', fontsize=11, fontweight='bold')
-        ax.set_title('Detector Efficiency Curve')
-        ax.grid(True, which='both', linestyle='--', alpha=0.5)
-        fig.tight_layout()
-        fig.show()
-
-        self._log(f"✅ Computed FEPE for {len(fepe_points)} identified peak(s): "
-                   f"{', '.join(labels)}. Efficiency curve plotted.")

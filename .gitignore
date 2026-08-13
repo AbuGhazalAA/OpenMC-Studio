@@ -35,3 +35,12 @@ projects/
 __pycache__/
 *.pyc
 *.pyo
+
+*.zip
+*.exe
+*.7z
+
+*recovery-codes*
+*secret*
+*.pem
+*.key

@@ -2,27 +2,19 @@ import os
 import re
 import sys
 import subprocess
+import time
 import numpy as np
 import openmc
+import multiprocessing
+
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QLineEdit,
+    QWidget, QVBoxLayout, QLabel, QLineEdit, QGroupBox,
     QComboBox, QPushButton, QFormLayout, QSplitter, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication
 )
 from PySide6.QtCore import Signal, QTimer, Qt
 from PySide6.QtGui import QPixmap, QWheelEvent, QPainter
 
 
-# OpenMC's interactive-only convenience plotters (Universe.plot(),
-# Model.plot(), Geometry.plot(), Cell.plot(), Region.plot()) route
-# through openmc.lib (the compiled C API via ctypes), which is
-# frequently unavailable or broken outside a full conda/Linux OpenMC
-# build (e.g. "Could not find module '...\\openmc\\lib\\libopenmc.so'").
-# Since this widget execs the script IN-PROCESS (unlike main.py's
-# subprocess-based pipeline, where the same protection is injected as
-# text into the script file), the fix here is a direct monkey-patch on
-# the already-imported openmc module -- applied fresh before every
-# exec() call, since a prior call may have already reset it via
-# openmc.reset_auto_ids() or a fresh re-import elsewhere.
 def _neutralize_interactive_plot_methods():
     def _safe_plot_stub(self, *args, **kwargs):
         print('[OpenMC Studio] Skipped interactive .plot() call '
@@ -36,8 +28,6 @@ def _neutralize_interactive_plot_methods():
 
 
 class ZoomableImageViewer(QGraphicsView):
-    """مستعرض صور متقدم يدعم التقريب (Zoom) والسحب (Pan) بالماوس"""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.scene = QGraphicsScene(self)
@@ -70,18 +60,14 @@ class ZoomableImageViewer(QGraphicsView):
 
 class PlotsPageWidget(QWidget):
     script_generated = Signal(str)
-
-    # Extra breathing room applied around a cell/geometry bounding box
-    # when auto-zooming, so the target isn't rendered edge-to-edge.
     ZOOM_MARGIN = 1.3
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._applying_preset = False
-        self._geometry_cells = {}  # populated by _refresh_cell_list(): {cell_id: openmc.Cell}
+        self._geometry_cells = {}
         self._init_ui()
 
-        # مؤقت للتحديث المباشر
         self.live_timer = QTimer(self)
         self.live_timer.setSingleShot(True)
         self.live_timer.timeout.connect(self.render_live_plot)
@@ -98,24 +84,19 @@ class PlotsPageWidget(QWidget):
         layout = QVBoxLayout(self)
         splitter = QSplitter()
 
-        left_panel = QWidget()
-        form = QFormLayout(left_panel)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
 
-        # NEW: fully generic navigation, driven by openmc's own
-        # bounding_box on Geometry/Cell -- works for ANY geometry, not
-        # just this one model, since nothing here is hardcoded to
-        # specific coordinates.
+        config_group = QGroupBox("2D Plot Configuration")
+        form = QFormLayout(config_group)
+
         self.view_combo = QComboBox()
         self.view_combo.addItems(["Custom", "Fit Full Geometry"])
         form.addRow("View:", self.view_combo)
 
         self.cell_combo = QComboBox()
         self.cell_combo.addItem("-- Zoom to cell --")
-        self.cell_combo.setToolTip(
-            "Populated automatically from whatever cells exist in the\n"
-            "current script after each render. Pick one to zoom the view\n"
-            "to that cell's own bounding box, with a margin around it."
-        )
+        self.cell_combo.setToolTip("Populated automatically from whatever cells exist in the script.")
         form.addRow("Zoom to Cell:", self.cell_combo)
 
         self.basis_combo = QComboBox()
@@ -123,22 +104,12 @@ class PlotsPageWidget(QWidget):
         form.addRow("Basis (Plane):", self.basis_combo)
 
         self.origin_field = QLineEdit("0.0, 0.0, 0.0")
-        self.origin_field.setToolTip(
-            "Center of the view, 'x, y, z' in cm.\n"
-            "Filled automatically by View / Zoom to Cell, or type your own."
-        )
+        self.origin_field.setToolTip("Center of the view, 'x, y, z' in cm.")
         form.addRow("Origin (cm):", self.origin_field)
 
         self.width_field = QLineEdit("40.0, 40.0")
         form.addRow("Width (cm):", self.width_field)
 
-        # Default resolution raised 600->1500 per axis (600x600 -> 2.25M
-        # px was too coarse to resolve sub-mm features even when zoomed
-        # in; 1500x1500 = 2.25M px gives ~6x finer detail per axis at
-        # the same Width. Push higher (e.g. 3000+) for a final
-        # high-detail capture once you've stopped typing -- each
-        # keystroke re-renders after an 800 ms pause, so very high
-        # values will feel laggy while typing.
         self.pixels_field = QLineEdit("1500, 1500")
         form.addRow("Resolution:", self.pixels_field)
 
@@ -146,26 +117,30 @@ class PlotsPageWidget(QWidget):
         self.color_combo.addItems(["material", "cell"])
         form.addRow("Color By:", self.color_combo)
 
+        left_layout.addWidget(config_group)
+
         self.btn_render = QPushButton("🔄 Force Render Now")
         self.btn_render.setStyleSheet("background-color: #0e639c; color: white; font-weight: bold; padding: 8px;")
         self.btn_render.clicked.connect(self.render_live_plot)
-        form.addRow(self.btn_render)
+        left_layout.addWidget(self.btn_render)
 
         self.btn_append = QPushButton("💾 Append Plot Code to Script")
-        self.btn_append.setStyleSheet("background-color: #4a4a4a; color: white; padding: 5px;")
+        self.btn_append.setStyleSheet("background-color: #4a4a4a; color: white; padding: 5px; font-weight: bold;")
         self.btn_append.clicked.connect(self.append_plot_code)
-        form.addRow(self.btn_append)
+        left_layout.addWidget(self.btn_append)
+
+        left_layout.addStretch()
 
         self.viewer = ZoomableImageViewer()
         self.viewer.setMinimumSize(400, 400)
 
-        splitter.addWidget(left_panel)
+        splitter.addWidget(left_widget)
         splitter.addWidget(self.viewer)
         splitter.setSizes([300, 700])
+
         layout.addWidget(splitter)
 
     def _log(self, msg):
-        """إرسال ذكي للرسائل إلى نافذة الكونسول أينما كانت"""
         try:
             for widget in QApplication.topLevelWidgets():
                 if hasattr(widget, 'console_widget'):
@@ -176,13 +151,9 @@ class PlotsPageWidget(QWidget):
         print(msg)
 
     def _trigger_live_update(self):
-        self.live_timer.start(800)
+        self.live_timer.start(300)
 
     def _on_manual_geometry_edit(self):
-        """Hand-editing Basis/Origin/Width means the view is no longer
-        exactly 'Fit Full Geometry' or a specific cell zoom -- reflect
-        that (unless this edit was itself caused programmatically by
-        _fill_fields_and_render)."""
         if not self._applying_preset:
             for combo in (self.view_combo, self.cell_combo):
                 if combo.currentIndex() != 0:
@@ -191,14 +162,7 @@ class PlotsPageWidget(QWidget):
                     combo.blockSignals(False)
         self._trigger_live_update()
 
-    # ------------------------------------------------------------------
-    # Generic geometry discovery (works for ANY script, not just this
-    # detector model): exec the current script and hand back whatever
-    # openmc.Geometry / openmc.Material objects it defines.
-    # ------------------------------------------------------------------
     def _exec_script_and_get_geometry(self):
-        """Returns (geometry, materials_list, error_message).
-        error_message is None on success."""
         main_win = self.window()
         if not hasattr(main_win, 'script_editor'):
             return None, [], "No script editor found."
@@ -236,8 +200,6 @@ class PlotsPageWidget(QWidget):
         return geom, mats, None
 
     def _refresh_cell_list(self, geom):
-        """Repopulate 'Zoom to Cell' from whatever cells actually exist
-        in the just-executed geometry -- generic for any model."""
         try:
             cells = geom.get_all_cells()
         except Exception:
@@ -255,10 +217,6 @@ class PlotsPageWidget(QWidget):
 
     @staticmethod
     def _safe_extent_and_center(bbox, basis, fallback_width=(20.0, 20.0)):
-        """Turn an openmc.BoundingBox into (center_xyz, (w_horiz, w_vert))
-        for the given basis, falling back to a sane default if the box
-        is unbounded/infinite in some direction (e.g. an open outer
-        cell with no capping surface)."""
         center = np.array(bbox.center, dtype=float)
         if not np.all(np.isfinite(center)):
             center = np.nan_to_num(center, nan=0.0, posinf=0.0, neginf=0.0)
@@ -275,8 +233,6 @@ class PlotsPageWidget(QWidget):
         return center, width
 
     def _fill_fields_and_render(self, basis, center, width):
-        """Programmatically set Basis/Origin/Width (with ZOOM_MARGIN
-        applied to width) and render immediately."""
         self._applying_preset = True
         try:
             self.basis_combo.setCurrentText(basis)
@@ -312,11 +268,10 @@ class PlotsPageWidget(QWidget):
         center, width = self._safe_extent_and_center(cell.bounding_box, basis)
         self._fill_fields_and_render(basis, center, width)
         self.view_combo.blockSignals(True)
-        self.view_combo.setCurrentIndex(0)  # "Custom" -- this is a cell zoom, not the full-geometry fit
+        self.view_combo.setCurrentIndex(0)
         self.view_combo.blockSignals(False)
 
     def render_live_plot(self):
-        """الرسم المعزول والذكي للمشروع"""
         try:
             o_str = self.origin_field.text().strip()
             w_str = self.width_field.text().strip()
@@ -327,21 +282,11 @@ class PlotsPageWidget(QWidget):
                 width_tuple = tuple(map(float, w_str.split(',')))
                 pixels_tuple = tuple(map(int, p_str.split(',')))
             except ValueError:
-                self._log("⚠️ Error: Origin, Width, or Resolution format is incorrect. "
-                           "Use 'X, Y, Z' for Origin and 'X, Y' for Width/Resolution.")
+                self._log("⚠️ Error: Origin, Width, or Resolution format is incorrect.")
                 return
 
-            if len(origin_tuple) != 3:
-                self._log(f"⚠️ Error: Origin must have exactly 3 comma-separated values "
-                           f"(x, y, z) -- got {len(origin_tuple)}. Example: '0.0, 0.0, 11.4'.")
-                return
-            if len(width_tuple) != 2:
-                self._log(f"⚠️ Error: Width must have exactly 2 comma-separated values "
-                           f"-- got {len(width_tuple)}. Example: '1.0, 0.3'.")
-                return
-            if len(pixels_tuple) != 2:
-                self._log(f"⚠️ Error: Resolution must have exactly 2 comma-separated values "
-                           f"-- got {len(pixels_tuple)}. Example: '1500, 1500'.")
+            if len(origin_tuple) != 3 or len(width_tuple) != 2 or len(pixels_tuple) != 2:
+                self._log(f"⚠️ Error: Origin must be (x,y,z). Width & Resolution must be (x,y).")
                 return
 
             b = self.basis_combo.currentText()
@@ -355,8 +300,6 @@ class PlotsPageWidget(QWidget):
                     self._log(f"⚠️ Live Preview Error: {err}")
                 return
 
-            # Keep "Zoom to Cell" in sync with whatever the script
-            # currently defines, generic to any geometry.
             self._refresh_cell_list(geom)
 
             export_path = os.path.abspath(os.path.join(os.getcwd(), "export", "main_plot"))
@@ -378,30 +321,49 @@ class PlotsPageWidget(QWidget):
                 plots = openmc.Plots([plot])
                 plots.export_to_xml()
 
-                # Direct subprocess call instead of openmc.plot_geometry()
-                # -- that wrapper's internal subprocess spawn shows a
-                # new, visible console window when this app is a frozen
-                # --windowed exe (no console for the openmc.exe child,
-                # which is itself a console application, to inherit).
-                # CREATE_NO_WINDOW suppresses that popup; harmless
-                # no-op (never evaluated) on non-Windows platforms.
-                # Already chdir'd into export_path above, matching the
-                # .export_to_xml() calls just before this, so no cwd=
-                # is needed here either.
                 creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                plot_result = subprocess.run(
-                    ["openmc", "--plot"], capture_output=True, text=True,
-                    creationflags=creationflags
-                )
-                if plot_result.returncode != 0:
+                ppm_path = os.path.join(export_path, "live_view.ppm")
+                img_path = os.path.join(export_path, "live_view.png")
+                max_attempts = 3
+                plot_result = None
+
+                threads = str(multiprocessing.cpu_count())
+
+                for attempt in range(1, max_attempts + 1):
+                    if os.path.exists(ppm_path):
+                        try: os.remove(ppm_path)
+                        except OSError: pass
+                    if os.path.exists(img_path):
+                        try: os.remove(img_path)
+                        except OSError: pass
+
+                    plot_result = subprocess.run(
+                        ["openmc", "-s", threads, "--plot"], capture_output=True, text=True,
+                        creationflags=creationflags
+                    )
+
+                    from PIL import Image
+                    if os.path.exists(ppm_path):
+                        try:
+                            im = Image.open(ppm_path)
+                            im.save(img_path, "PNG")
+                        except Exception as e:
+                            self._log(f"⚠️ Image conversion failed: {e}")
+
+                    if plot_result.returncode == 0 and os.path.exists(img_path):
+                        break
+
+                    if attempt < max_attempts:
+                        time.sleep(0.4 * attempt)
+
+                if plot_result.returncode != 0 or not os.path.exists(img_path):
                     details = (plot_result.stderr or plot_result.stdout or "(no output captured)").strip()
-                    self._log(f"⚠️ Live Preview Error: Plot generation failed "
+                    self._log(f"⚠️ Live Preview Error: Plot generation failed after {max_attempts} attempts "
                                f"(exit code {plot_result.returncode}):\n{details}")
                     return
             finally:
                 os.chdir(original_dir)
 
-            img_path = os.path.join(export_path, "live_view.png")
             if os.path.exists(img_path):
                 pixmap = QPixmap()
                 pixmap.load(img_path)
@@ -414,7 +376,6 @@ class PlotsPageWidget(QWidget):
             self._log(f"⚠️ Live Preview Error: {str(e)}")
 
     def append_plot_code(self):
-        """إضافة كود إعدادات الرسم للمحرر إذا رغب المستخدم في حفظه"""
         o = self.origin_field.text().strip()
         w = self.width_field.text().strip()
         p = self.pixels_field.text().strip()
@@ -439,7 +400,6 @@ class PlotsPageWidget(QWidget):
         self._log("✅ Plot code appended to script editor.")
 
     def display_image(self, path):
-        """تستقبل هذه الدالة مسار الصورة من النافذة الرئيسية (الزر العلوي) وتقوم بعرضها بالعارض الذكي"""
         if os.path.exists(path):
             pixmap = QPixmap()
             pixmap.load(path)
