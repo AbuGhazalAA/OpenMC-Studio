@@ -507,7 +507,18 @@ class TrackSimulationWorker(QThread):
             openmc.Plots([plot]).export_to_xml(os.path.join(track_dir, "plots.xml"))
 
             geometry_png = os.path.join(track_dir, "tracks_bg.png")
+            geometry_ppm = os.path.join(track_dir, "tracks_bg.ppm")
 
+            # An OpenMC built WITHOUT libpng -- which includes the Windows
+            # v0.16.0 build this app is commonly used with -- writes its
+            # plot as a .ppm, not a .png, and still exits 0. Waiting for a
+            # .png that is never going to appear made this page retry three
+            # times and then report "failed after 3 attempts (exit code 0)"
+            # on a plot run that had in fact succeeded. ui/plots/plots_page.py
+            # already converts the .ppm with Pillow, which is exactly why
+            # the 2D Geometry Viewer worked while this page did not; the
+            # same conversion is done here.
+            #
             # Retry on failure: a libpng "Write Error" can be a passing
             # hiccup (antivirus real-time scan, OneDrive/cloud sync,
             # Windows Search indexing briefly locking the file), OR --
@@ -519,16 +530,28 @@ class TrackSimulationWorker(QThread):
             # Same creationflags fix as the transport run above.
             max_attempts = 3
             plot_result = None
+            convert_error = None
             for attempt in range(1, max_attempts + 1):
-                if os.path.exists(geometry_png):
-                    try:
-                        os.remove(geometry_png)
-                    except OSError:
-                        pass  # if this itself is locked, let the write attempt surface that
+                for stale in (geometry_png, geometry_ppm):
+                    if os.path.exists(stale):
+                        try:
+                            os.remove(stale)
+                        except OSError:
+                            pass  # if this itself is locked, let the write attempt surface that
                 plot_result = subprocess.run(
                     ["openmc", "--plot"], cwd=track_dir, capture_output=True, text=True,
                     creationflags=creationflags
                 )
+                if not os.path.exists(geometry_png) and os.path.exists(geometry_ppm):
+                    try:
+                        from PIL import Image
+                        with Image.open(geometry_ppm) as im:
+                            im.save(geometry_png, "PNG")
+                        self.log_signal.emit(
+                            "[OpenMC Studio] This OpenMC build wrote a .ppm plot "
+                            "(no libpng); converted it to .png.")
+                    except Exception as conv_err:
+                        convert_error = conv_err
                 if plot_result.returncode == 0 and os.path.exists(geometry_png):
                     break
                 if attempt < max_attempts:
@@ -536,6 +559,14 @@ class TrackSimulationWorker(QThread):
 
             if plot_result.returncode != 0 or not os.path.exists(geometry_png):
                 details = (plot_result.stderr or plot_result.stdout or "(no output captured)").strip()
+                if convert_error is not None:
+                    details = (f"OpenMC wrote {os.path.basename(geometry_ppm)}, but converting it "
+                               f"to PNG failed: {convert_error}\n"
+                               f"Pillow is required to read this build's plot output "
+                               f"(pip install Pillow).\n\n") + details
+                elif os.path.exists(geometry_ppm):
+                    details = ("OpenMC produced a .ppm plot that could not be converted "
+                               "to PNG.\n\n") + details
                 self.finished_signal.emit(
                     False,
                     f"Background plot generation failed after {max_attempts} attempts "
