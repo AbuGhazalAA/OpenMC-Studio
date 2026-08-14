@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -8,7 +9,7 @@ import openmc
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QFormLayout, QSplitter, QSpinBox, QApplication, QCheckBox,
-    QDialog, QProgressBar
+    QDialog, QProgressBar, QMessageBox
 )
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 from PySide6.QtGui import QPixmap
@@ -319,7 +320,12 @@ class TrackSimulationWorker(QThread):
     geometry+tracks overlay image. Runs off the GUI thread since this is
     an actual simulation, not an instant preview render.
     """
-    finished_signal = Signal(bool, str, list)  # success, message, list of frame PNG paths (empty list on failure)
+    # success, message, list of frame PNG paths (empty on failure), diagnostics
+    # dict. The diagnostics carry the real bounding box of every recorded
+    # track point so the page can tell the user when a run genuinely
+    # succeeded but every track fell outside the requested Origin/Width --
+    # which renders a perfectly correct image with nothing visible on it.
+    finished_signal = Signal(bool, str, list, dict)
     # Emitted for every line OpenMC itself prints during the transport
     # run, as it's printed -- so the Live Output Console shows real
     # activity WHILE the run is in progress instead of staying silent
@@ -354,10 +360,30 @@ class TrackSimulationWorker(QThread):
             track_dir = os.path.join(self.export_root, "tracks")
             os.makedirs(track_dir, exist_ok=True)
 
+            # Pre-flight: the whole page shells out to the `openmc`
+            # executable twice (transport run, then the background plot).
+            # If it isn't on PATH, Popen raises FileNotFoundError deep
+            # inside the run and the user is left with an empty viewer and
+            # a cryptic message. Check once, up front, and say exactly what
+            # is missing and how to fix it.
+            if shutil.which("openmc") is None:
+                self.finished_signal.emit(
+                    False,
+                    "The 'openmc' executable was not found on your PATH.\n\n"
+                    "The Particle Tracks page runs a real OpenMC transport calculation "
+                    "as a separate process, so the openmc program itself must be "
+                    "launchable from a terminal -- the Python 'openmc' package alone "
+                    "is not enough.\n\n"
+                    "To check, open a terminal and run:  openmc --version\n"
+                    "If that fails, add the folder containing openmc.exe to your PATH "
+                    "environment variable and restart OpenMC Studio.",
+                    [], {})
+                return
+
             geometry, materials_list, settings_obj, tallies_obj, err = \
                 _discover_model_objects(self.script_code)
             if err:
-                self.finished_signal.emit(False, err, [])
+                self.finished_signal.emit(False, err, [], {})
                 return
 
             # Override settings for a FAST, track-focused run only -- this
@@ -418,10 +444,24 @@ class TrackSimulationWorker(QThread):
                 combined_lines = []
                 if attempt > 1:
                     self.log_signal.emit(f"[OpenMC Studio] Retrying transport run (attempt {attempt}/{max_attempts})...")
-                process = subprocess.Popen(
-                    ["openmc"], cwd=track_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, creationflags=creationflags
-                )
+                try:
+                    process = subprocess.Popen(
+                        ["openmc"], cwd=track_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, creationflags=creationflags
+                    )
+                except OSError as launch_err:
+                    # The PATH pre-flight above catches the usual case, but
+                    # the executable can still be unlaunchable (wrong
+                    # architecture, missing DLL, blocked by policy). Report
+                    # that as itself rather than as a mystery empty viewer.
+                    self.finished_signal.emit(
+                        False,
+                        f"Could not start the 'openmc' process: {launch_err}\n\n"
+                        "The program was found on your PATH but refused to launch. "
+                        "Try running 'openmc --version' in a terminal to see the "
+                        "underlying error.",
+                        [], {})
+                    return
                 for line in process.stdout:
                     clean_line = line.rstrip()
                     combined_lines.append(clean_line)
@@ -439,7 +479,7 @@ class TrackSimulationWorker(QThread):
             if returncode != 0:
                 details = "\n".join(combined_lines).strip() or "(no output captured)"
                 self.finished_signal.emit(
-                    False, f"Transport run failed (exit code {returncode}):\n{details}", [])
+                    False, f"Transport run failed (exit code {returncode}):\n{details}", [], {})
                 return
 
             tracks_h5 = os.path.join(track_dir, "tracks.h5")
@@ -448,7 +488,7 @@ class TrackSimulationWorker(QThread):
                     False,
                     "tracks.h5 was not generated -- the run may have failed silently. "
                     "Check that the model has valid cross-section data and a proper source.",
-                    [])
+                    [], {})
                 return
 
             # Background geometry plot -- same underlying mechanism as
@@ -500,7 +540,7 @@ class TrackSimulationWorker(QThread):
                     False,
                     f"Background plot generation failed after {max_attempts} attempts "
                     f"(exit code {plot_result.returncode}):\n{details}",
-                    [])
+                    [], {})
                 return
 
             tracks = openmc.Tracks(tracks_h5)
@@ -596,12 +636,25 @@ class TrackSimulationWorker(QThread):
                                  dpi=150 if is_last else 80)
                 frame_paths.append(frame_path)
 
+            # Hand the raw numbers back too, so the page can tell apart
+            # "nothing was tracked" from "everything was tracked but lies
+            # outside the requested view" -- two situations that produce
+            # the exact same blank-looking image.
+            diagnostics = {
+                'n_primary': n_primary,
+                'n_secondary_total': n_secondary_total,
+                'n_single_state': n_single_state,
+                'has_any_points': bool(has_any_points),
+                'mins': pt_mins.tolist() if has_any_points else None,
+                'maxs': pt_maxs.tolist() if has_any_points else None,
+            }
             self.finished_signal.emit(
-                True, f"Rendered {len(tracks)} tracked source-particle histories. {diag}", frame_paths)
+                True, f"Rendered {len(tracks)} tracked source-particle histories. {diag}",
+                frame_paths, diagnostics)
 
         except Exception as e:
             msg = str(e).strip() or f"{type(e).__name__} (no message attached to the exception)"
-            self.finished_signal.emit(False, msg, [])
+            self.finished_signal.emit(False, msg, [], {})
 
 
 class _RunningNoticeDialog(QDialog):
@@ -754,6 +807,32 @@ class TracksPageWidget(QWidget):
             pass
         print(msg)
 
+    def _fail(self, title, message):
+        """Report a failure BOTH in the console log and in a dialog.
+
+        Every failure path on this page used to end at a single _log()
+        line. If the Live Output Console happened to be collapsed or the
+        user was looking at the viewer, the entire visible outcome of a
+        failed run was: the button re-enables, the orange notice window
+        disappears, and the image area stays empty -- indistinguishable
+        from the app doing nothing at all. A tracked run takes real time
+        and real CPU, so it must never fail invisibly.
+        """
+        self._log(f"⚠️ {title}: {message}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        # Long OpenMC output goes in the detail pane so the dialog stays a
+        # readable size, and stays selectable so it can be copied out.
+        if len(message) > 300 or message.count("\n") > 6:
+            head, _, tail = message.partition("\n")
+            box.setText(head.strip() or "The tracked simulation could not be completed.")
+            box.setDetailedText(tail.strip() or message)
+        else:
+            box.setText(message)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
+
     def _parse_fields(self):
         o_str = self.origin_field.text().strip()
         w_str = self.width_field.text().strip()
@@ -775,16 +854,20 @@ class TracksPageWidget(QWidget):
     def run_tracked_simulation(self):
         main_win = self.window()
         if not hasattr(main_win, 'script_editor'):
-            self._log("\u26a0\ufe0f Error: No script editor found.")
+            self._fail("Particle Tracks", "No script editor was found in the main window.")
             return
         code = main_win.script_editor.editor.toPlainText()
         if not code.strip():
-            self._log("\u26a0\ufe0f Error: Script is empty.")
+            self._fail(
+                "Script Is Empty",
+                "There is no model to track.\n\n"
+                "Build a model first (Materials, Geometry, Settings) or open an "
+                "existing script, then run the tracked simulation.")
             return
 
         origin, width, pixels, err = self._parse_fields()
         if err:
-            self._log(f"\u26a0\ufe0f Error: {err}")
+            self._fail("Invalid Plot Settings", err)
             return
 
         export_root = os.path.abspath(os.path.join(os.getcwd(), "export"))
@@ -814,7 +897,7 @@ class TracksPageWidget(QWidget):
         self._worker.finished_signal.connect(self._on_tracked_run_finished)
         self._worker.start()
 
-    def _on_tracked_run_finished(self, success, message, frame_paths):
+    def _on_tracked_run_finished(self, success, message, frame_paths, diagnostics=None):
         self.btn_run.setEnabled(True)
         self.btn_run.setText("\U0001F3AF Run Tracked Simulation")
         self.progress_bar.setVisible(False)
@@ -823,11 +906,18 @@ class TracksPageWidget(QWidget):
             self._running_dialog = None
 
         if not success:
-            self._log(f"\u26a0\ufe0f Tracked Simulation Error: {message}")
+            self._fail("Tracked Simulation Failed", message)
             return
 
         self._log(f"\u2705 {message}")
         if not frame_paths:
+            # Previously a bare `return`: the run reported success but the
+            # viewer stayed empty with nothing written anywhere at all.
+            self._fail(
+                "No Image Was Produced",
+                "The run reported success but produced no image frames. "
+                "Check the export/tracks folder for a partially written file, "
+                "then run again.")
             return
 
         # Animated "replay": step through the progressively-revealed
@@ -842,6 +932,104 @@ class TracksPageWidget(QWidget):
             self._anim_timer = QTimer(self)
             self._anim_timer.timeout.connect(self._advance_animation_frame)
         self._anim_timer.start(270)  # ms per frame (6 frames now, was 12 at 180ms)
+        self._warn_if_nothing_visible(diagnostics or {})
+
+    def _warn_if_nothing_visible(self, diagnostics):
+        """Explain a technically-correct image that still looks empty.
+
+        A run can succeed completely and still show nothing, for reasons
+        the image itself cannot convey:
+          * no position states were recorded at all;
+          * every particle was absorbed at birth (one state each, so there
+            is no line to draw -- only a dot);
+          * the tracks are real and were drawn, but lie entirely outside
+            the requested Origin/Width, so they fall off the edge of the
+            canvas.
+        The third is the easy one to mistake for a broken feature, and it
+        is also the one we can fix for the user: the bounding box of the
+        recorded points gives the exact Origin/Width that would frame
+        them, so offer those numbers instead of just reporting a problem.
+        """
+        if not diagnostics:
+            return
+
+        if not diagnostics.get('has_any_points'):
+            self._fail(
+                "No Track Data Recorded",
+                "The run finished, but OpenMC recorded no particle positions at all.\n\n"
+                "This usually means the source produced no particles inside the "
+                "geometry. Check that settings.source is defined and that its "
+                "position lies inside a cell of the model.")
+            return
+
+        mins = np.asarray(diagnostics.get('mins'), dtype=float)
+        maxs = np.asarray(diagnostics.get('maxs'), dtype=float)
+
+        basis = self.basis_combo.currentText()
+        h_idx, v_idx = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}[basis]
+        origin, width, _pixels, err = self._parse_fields()
+        if err:
+            return
+
+        h_lo, h_hi = origin[h_idx] - width[0] / 2.0, origin[h_idx] + width[0] / 2.0
+        v_lo, v_hi = origin[v_idx] - width[1] / 2.0, origin[v_idx] + width[1] / 2.0
+
+        # Do the track extents overlap the visible window at all? Compared
+        # as intervals rather than testing individual points, so a track
+        # that merely passes through the view still counts as visible.
+        overlaps = (mins[h_idx] <= h_hi and maxs[h_idx] >= h_lo and
+                    mins[v_idx] <= v_hi and maxs[v_idx] >= v_lo)
+        if overlaps:
+            n_single = diagnostics.get('n_single_state', 0)
+            n_total = diagnostics.get('n_secondary_total', 0)
+            if n_total and n_single == n_total:
+                self._fail(
+                    "No Track Lines to Draw",
+                    "Every tracked particle has only one recorded state, so there "
+                    "are no lines to draw -- only the birth points.\n\n"
+                    "This means each particle was absorbed at the moment it was "
+                    "born. It is a real physical result, not a display error: "
+                    "check the source energy and the material at the source "
+                    "position.")
+            return
+
+        # Centre the view on the tracks and pad the span by 10% so the
+        # extremes do not sit exactly on the border.
+        new_origin = list(origin)
+        for idx in (h_idx, v_idx):
+            new_origin[idx] = (mins[idx] + maxs[idx]) / 2.0
+        span_h = max(maxs[h_idx] - mins[h_idx], 1.0) * 1.1
+        span_v = max(maxs[v_idx] - mins[v_idx], 1.0) * 1.1
+
+        suggested_origin = ", ".join(f"{v:.2f}" for v in new_origin)
+        suggested_width = f"{span_h:.2f}, {span_v:.2f}"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Tracks Are Outside the Current View")
+        box.setText(
+            "The simulation worked and the tracks were drawn, but all of them "
+            "lie outside the region you asked to see, so the image looks empty.")
+        box.setInformativeText(
+            f"Tracks occupy:\n"
+            f"    x [{mins[0]:.2f}, {maxs[0]:.2f}]   "
+            f"y [{mins[1]:.2f}, {maxs[1]:.2f}]   "
+            f"z [{mins[2]:.2f}, {maxs[2]:.2f}]  cm\n\n"
+            f"Current view ({basis} plane):\n"
+            f"    horizontal [{h_lo:.2f}, {h_hi:.2f}]   "
+            f"vertical [{v_lo:.2f}, {v_hi:.2f}]  cm\n\n"
+            f"Suggested settings:\n"
+            f"    Origin: {suggested_origin}\n"
+            f"    Width:  {suggested_width}")
+        apply_btn = box.addButton("Use These Settings", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Keep Mine", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if box.clickedButton() is apply_btn:
+            self.origin_field.setText(suggested_origin)
+            self.width_field.setText(suggested_width)
+            self._log(f"🎯 View reframed to Origin ({suggested_origin}), Width ({suggested_width}). "
+                      "Run the tracked simulation again to see the tracks.")
 
     def _advance_animation_frame(self):
         if self._anim_index >= len(self._anim_frames):
