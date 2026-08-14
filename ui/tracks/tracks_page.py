@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import time
+import h5py
 import numpy as np
 import openmc
 
@@ -49,6 +50,137 @@ PARTICLE_COLORS = {
     'electron': '#d62728',
     'positron': '#ff7f0e',
 }
+
+# ── Reading tracks.h5 without depending on the openmc Python package ──
+#
+# OpenMC's C++ writer (src/track_output.cpp) stores the particle type as a
+# PDG Monte Carlo number:
+#     write_attribute(dset, "particles", particles);   // pdg_number()
+# while openmc/tracks.py turns that straight back into a type:
+#     ptype = ParticleType(particle)
+#
+# Those two halves only agree when the binary and the Python package come
+# from the same era. In OpenMC 0.16 ParticleType became a PDG-backed class;
+# before that it was an IntEnum numbered 0..3. Pair a PDG-writing binary
+# with a pre-PDG package -- which is what the openmc-windows-beta build
+# ships -- and reading any track file dies with:
+#     np.int32(22) is not a valid ParticleType
+# (22 being the PDG number for a photon). Nothing is wrong with the run or
+# the file; only the reader disagrees.
+#
+# So the file is also readable directly through h5py, accepting BOTH
+# conventions. Same approach already used for depletion_results.h5 in
+# ui/results_page.py, and for the same reason.
+_PDG_TO_NAME = {
+    2112: 'neutron',
+    22: 'photon',
+    11: 'electron',
+    -11: 'positron',
+    2212: 'proton',
+    1000010020: 'deuteron',
+    1000010030: 'triton',
+    1000020040: 'alpha',
+}
+
+# Pre-0.16 files stored a bare 0..3 index here instead of a PDG number.
+# The two encodings cannot collide: no legacy index is a PDG number in the
+# table above, so trying PDG first and falling back is unambiguous.
+_LEGACY_INDEX_TO_PDG = {0: 2112, 1: 22, 2: 11, 3: -11}
+
+
+class _DirectParticleType:
+    """Stands in for openmc.ParticleType, exposing just the `.name` the
+    rendering code reads."""
+    __slots__ = ('name', 'pdg_number')
+
+    def __init__(self, name, pdg_number):
+        self.name = name
+        self.pdg_number = pdg_number
+
+    def __repr__(self):
+        return self.name
+
+
+class _DirectParticleTrack:
+    """Mirrors openmc.ParticleTrack: a particle type plus its states."""
+    __slots__ = ('particle', 'states')
+
+    def __init__(self, particle, states):
+        self.particle = particle
+        self.states = states
+
+
+class _DirectTrack:
+    """Mirrors openmc.Track: one source history and everything it spawned."""
+    __slots__ = ('particle_tracks', 'identifier')
+
+    def __init__(self, particle_tracks, identifier=(0, 0, 0)):
+        self.particle_tracks = particle_tracks
+        self.identifier = identifier
+
+
+def _track_sort_key(dset_name):
+    """Datasets are named track_<batch>_<generation>_<particle id>; sort by
+    those numbers so histories come out in run order rather than the
+    lexicographic order that would put track_10 before track_2."""
+    try:
+        _, batch, gen, particle = dset_name.split('_')
+        return (int(batch), int(gen), int(particle))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def _particle_name_from_code(code):
+    """PDG number (or legacy 0..3 index) -> lowercase particle name."""
+    code = int(code)
+    if code in _PDG_TO_NAME:
+        return _PDG_TO_NAME[code]
+    if code in _LEGACY_INDEX_TO_PDG:
+        return _PDG_TO_NAME[_LEGACY_INDEX_TO_PDG[code]]
+    return f'particle {code}'
+
+
+def _read_tracks_h5(filepath, particle_filter='all'):
+    """Read tracks.h5 with plain h5py, returning objects shaped like the
+    ones openmc.Tracks yields.
+
+    Layout, per OpenMC's own writer and reader:
+        /track_<batch>_<gen>_<id>   Dataset of states
+            attrs['offsets']    where each particle's states start,
+                                with a final entry closing the last slice
+            attrs['particles']  one particle code per slice
+    """
+    tracks = []
+    with h5py.File(filepath, 'r') as fh:
+        for dset_name in sorted(fh, key=_track_sort_key):
+            dset = fh[dset_name]
+            if not isinstance(dset, h5py.Dataset):
+                continue
+            states = dset[()]
+            if 'offsets' not in dset.attrs or 'particles' not in dset.attrs:
+                continue
+
+            offsets = np.atleast_1d(dset.attrs['offsets']).astype(np.int64)
+            particles = np.atleast_1d(dset.attrs['particles']).astype(np.int64)
+
+            # OpenMC writes one more offset than particles so the last
+            # slice is closed. Tolerate a file that omits that final entry
+            # rather than dropping the last particle of every history.
+            if offsets.size == particles.size:
+                offsets = np.append(offsets, len(states))
+
+            particle_tracks = []
+            for code, start, end in zip(particles, offsets[:-1], offsets[1:]):
+                name = _particle_name_from_code(code)
+                if particle_filter != 'all' and name != particle_filter:
+                    continue
+                particle_tracks.append(_DirectParticleTrack(
+                    _DirectParticleType(name, int(code)),
+                    states[int(start):int(end)]))
+
+            if particle_tracks:
+                tracks.append(_DirectTrack(particle_tracks, _track_sort_key(dset_name)))
+    return tracks
 
 # Interaction (collision) detection uses OpenMC's own recorded cell_id/
 # material_id per state, not a guessed angle threshold: a state transition
@@ -574,9 +706,44 @@ class TrackSimulationWorker(QThread):
                     [], {})
                 return
 
-            tracks = openmc.Tracks(tracks_h5)
-            if self.particle_filter != 'all':
-                tracks = tracks.filter(particle=self.particle_filter)
+            # Prefer OpenMC's own reader -- it tracks any future change to
+            # the file format -- but fall back to reading the HDF5 directly
+            # when the installed package cannot decode what the binary
+            # wrote (see _read_tracks_h5 for the PDG/IntEnum mismatch that
+            # makes this necessary on some builds).
+            try:
+                tracks = openmc.Tracks(tracks_h5)
+                if self.particle_filter != 'all':
+                    tracks = tracks.filter(particle=self.particle_filter)
+            except Exception as read_err:
+                self.log_signal.emit(
+                    f"[OpenMC Studio] openmc.Tracks could not read the file ({read_err}); "
+                    "falling back to reading tracks.h5 directly.")
+                try:
+                    tracks = _read_tracks_h5(tracks_h5, self.particle_filter)
+                except Exception as direct_err:
+                    self.finished_signal.emit(
+                        False,
+                        f"tracks.h5 could not be read.\n\n"
+                        f"OpenMC's own reader failed with: {read_err}\n"
+                        f"Reading the file directly also failed with: {direct_err}\n\n"
+                        "The file may be truncated or written in an unrecognised format.",
+                        [], {})
+                    return
+
+            if len(tracks) == 0:
+                if self.particle_filter != 'all':
+                    message = (
+                        f"No {self.particle_filter} tracks were recorded.\n\n"
+                        "The run itself worked, but no particle of this type was "
+                        "tracked. Set 'Show Particle Type' back to 'all' to see "
+                        "what was actually produced.")
+                else:
+                    message = ("tracks.h5 was written but contains no particle "
+                               "histories at all. Check that the source produces "
+                               "particles inside the geometry.")
+                self.finished_signal.emit(False, message, [], {})
+                return
 
             # Diagnostic summary -- printed via the worker's own stdout,
             # which the app's Live Output Console does not capture, so
