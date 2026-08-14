@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 
@@ -45,6 +46,49 @@ NUCLIDE_GAMMA_LINES = {
 }
 
 
+# Atomic numbers of the actinides. "Heavy metal" in the burnup unit MWd/kgHM
+# conventionally means Z >= 90 (thorium and above) -- structural elements and
+# the oxygen in an oxide fuel are deliberately NOT part of that mass.
+_HEAVY_METAL_Z = {
+    'Th': 90, 'Pa': 91, 'U': 92, 'Np': 93, 'Pu': 94, 'Am': 95, 'Cm': 96,
+    'Bk': 97, 'Cf': 98, 'Es': 99, 'Fm': 100,
+}
+_AVOGADRO = 6.02214076e23
+
+
+def _split_nuclide_name(name):
+    """'U235' -> ('U', 235); 'Am242m' -> ('Am', 242); returns (None, None)
+    for anything that is not an element symbol followed by a mass number."""
+    m = re.match(r'^([A-Za-z]+)(\d+)', str(name))
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
+
+
+def _heavy_metal_mass_kg(atoms_row, nuc_index):
+    """Initial heavy-metal mass in kg, computed straight from the atom
+    inventory the depletion file already stores.
+
+        m_HM = sum over actinides of  N_i * A_i / N_A
+
+    Burnup is by definition referred to the INITIAL heavy metal mass, so
+    this is meant to be called with the FIRST depletion step's row.
+
+    The mass number A is used in place of the exact atomic mass: for the
+    actinides that approximation is accurate to about 0.02% (U235 is
+    235.0439, U238 is 238.0508), which is far below the statistical
+    uncertainty of any Monte Carlo depletion run.
+    """
+    if atoms_row is None:
+        return 0.0
+    grams = 0.0
+    for name, idx in nuc_index.items():
+        element, mass_number = _split_nuclide_name(name)
+        if element in _HEAVY_METAL_Z and mass_number and idx < len(atoms_row):
+            grams += float(atoms_row[idx]) * mass_number / _AVOGADRO
+    return grams / 1000.0
+
+
 def _identify_nuclide(energy_keV, fwhm_keV, tolerance_factor=3.0, min_tolerance_keV=1.0):
     tolerance = max(tolerance_factor * fwhm_keV, min_tolerance_keV)
     best = None
@@ -68,17 +112,16 @@ class ResultsPageWidget(QWidget):
         self._current_fig = None
         self._current_ax = None
         self._last_peaks = []
-        # --- Automatic Tally visualization ---
-        self._tally_canvas = None
-        self._tally_figure = None
-        self._tally_ax = None
+        self._depletion_data = {}
+
         self._init_ui()
+        self._setup_tally_plot_dialog()
         self._setup_hpge_dialog()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # --- 1. قسم تحميل الملف ---
+        # --- 1. File Load Section ---
         load_layout = QHBoxLayout()
         self.btn_load = QPushButton("📂 Load StatePoint File")
         self.btn_load.setStyleSheet(
@@ -93,7 +136,7 @@ class ResultsPageWidget(QWidget):
         load_layout.addStretch()
         layout.addLayout(load_layout)
 
-        # --- 2. قسم معامل التكاثر النيوتروني (K-Effective) ---
+        # --- 2. K-Effective Section ---
         keff_group = QGroupBox("⚛️ K-Effective (Multiplication Factor)")
         keff_group.setStyleSheet("font-weight: bold; font-size: 14px;")
         keff_layout = QVBoxLayout(keff_group)
@@ -104,7 +147,7 @@ class ResultsPageWidget(QWidget):
         keff_layout.addWidget(self.lbl_keff)
         layout.addWidget(keff_group)
 
-        # --- 3. القسم العام: العدادات (Tallies) والنتائج الأساسية ---
+        # --- 3. General Section: Tallies & Results ---
         tally_group = QGroupBox("📊 General Tallies & Results")
         tally_group.setStyleSheet("font-weight: bold; font-size: 14px;")
         tally_layout = QVBoxLayout(tally_group)
@@ -124,15 +167,22 @@ class ResultsPageWidget(QWidget):
         self.combo_mesh_score = QComboBox()
         combo_layout.addWidget(self.combo_mesh_score)
 
-        self.btn_plot_mesh = QPushButton("🗺️ Plot Mesh Tally (Heatmap)")
+        self.btn_plot_mesh = QPushButton("🗺️ Plot Mesh (Heatmap)")
         self.btn_plot_mesh.setStyleSheet("background-color: #d97706; color: white; padding: 5px; font-weight: bold;")
         self.btn_plot_mesh.clicked.connect(self.plot_mesh_tally)
         combo_layout.addWidget(self.btn_plot_mesh)
 
+        # --- Button to open independent plot window ---
+        self.btn_open_plot_dialog = QPushButton("📈 Open Plot Window")
+        self.btn_open_plot_dialog.setStyleSheet(
+            "background-color: #0e639c; color: white; padding: 5px; font-weight: bold;")
+        self.btn_open_plot_dialog.clicked.connect(self.open_tally_plot_window)
+        combo_layout.addWidget(self.btn_open_plot_dialog)
+
         combo_layout.addStretch()
         tally_layout.addLayout(combo_layout)
 
-        # جدول عرض البيانات الخام
+        # Raw data table
         self.table_tally = QTableWidget()
         self.table_tally.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table_tally.setStyleSheet("font-weight: normal; font-size: 12px;")
@@ -140,63 +190,7 @@ class ResultsPageWidget(QWidget):
 
         layout.addWidget(tally_group)
 
-        # --- Automatic Tally Visualization ---
-        plot_group = QGroupBox("📈 Tally Visualization")
-        plot_group.setStyleSheet("font-weight: bold; font-size: 14px;")
-        plot_layout = QVBoxLayout(plot_group)
-
-        plot_controls = QHBoxLayout()
-        plot_controls.addWidget(QLabel("Plot Type:"))
-        self.combo_tally_plot_type = QComboBox()
-        self.combo_tally_plot_type.addItems([
-            "Auto", "Line", "Bar", "Mesh Heatmap"
-        ])
-        self.combo_tally_plot_type.currentIndexChanged.connect(
-            lambda _index: self._plot_selected_tally()
-        )
-        plot_controls.addWidget(self.combo_tally_plot_type)
-
-        self.btn_plot_tally = QPushButton("📊 Plot Selected Tally")
-        self.btn_plot_tally.setStyleSheet(
-            "background-color: #0e639c; color: white; padding: 6px; font-weight: bold;"
-        )
-        self.btn_plot_tally.clicked.connect(self._plot_selected_tally)
-        plot_controls.addWidget(self.btn_plot_tally)
-
-        self.btn_save_tally_plot = QPushButton("💾 Save Plot")
-        self.btn_save_tally_plot.clicked.connect(self._save_tally_plot)
-        plot_controls.addWidget(self.btn_save_tally_plot)
-
-        # زر استخراج البيانات إلى إكسل الجديد
-        self.btn_export_plot_data = QPushButton("📊 Export Plot Data to Excel/CSV")
-        self.btn_export_plot_data.setStyleSheet(
-            "background-color: #d97706; color: white; padding: 6px; font-weight: bold;")
-        self.btn_export_plot_data.clicked.connect(self.export_plot_to_excel)
-        plot_controls.addWidget(self.btn_export_plot_data)
-
-        plot_controls.addStretch()
-        plot_layout.addLayout(plot_controls)
-
-        self.tally_plot_status = QLabel(
-            "Select a Tally to display its graphical result."
-        )
-        self.tally_plot_status.setStyleSheet(
-            "color: #666666; font-style: italic; font-weight: normal;"
-        )
-        plot_layout.addWidget(self.tally_plot_status)
-
-        self.tally_plot_container = QWidget()
-        self.tally_plot_container.setMinimumHeight(360)
-        self.tally_plot_container.setStyleSheet(
-            "background-color: white; border: 1px solid #d0d0d0;"
-        )
-        self.tally_plot_layout = QVBoxLayout(self.tally_plot_container)
-        self.tally_plot_layout.setContentsMargins(4, 4, 4, 4)
-        plot_layout.addWidget(self.tally_plot_container)
-
-        layout.addWidget(plot_group)
-
-        # --- 4. زر فتح نافذة التحليل الطيفي (مخفي افتراضياً) ---
+        # --- 4. Spectral analysis window button (hidden by default) ---
         self.btn_open_hpge = QPushButton("🚀 Open Advanced HPGe Spectral Analysis")
         self.btn_open_hpge.setStyleSheet(
             "background-color: #8e44ad; color: white; font-weight: bold; font-size: 15px; padding: 12px;")
@@ -204,8 +198,92 @@ class ResultsPageWidget(QWidget):
         self.btn_open_hpge.clicked.connect(self.show_hpge_dialog)
         layout.addWidget(self.btn_open_hpge)
 
+    def _setup_tally_plot_dialog(self):
+        """Setup independent plot window"""
+        self.tally_plot_dialog = QDialog(self)
+        self.tally_plot_dialog.setWindowTitle("📈 Advanced Tally Visualization")
+        self.tally_plot_dialog.setMinimumSize(900, 650)
+        self.tally_plot_dialog.setWindowFlags(
+            self.tally_plot_dialog.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
+        self.tally_plot_dialog.setStyleSheet("QDialog { background-color: #FFFFFF; }")
+
+        layout = QVBoxLayout(self.tally_plot_dialog)
+
+        plot_controls = QHBoxLayout()
+
+        # 1. Plot settings for normal tallies
+        plot_controls.addWidget(QLabel("<b>Plot Type:</b>"))
+        self.tally_plot_dialog.combo_plot_type = QComboBox()
+        self.tally_plot_dialog.combo_plot_type.addItems(["Auto", "Line", "Bar", "Mesh Heatmap"])
+        self.tally_plot_dialog.combo_plot_type.currentIndexChanged.connect(lambda _: self._plot_selected_tally())
+        plot_controls.addWidget(self.tally_plot_dialog.combo_plot_type)
+
+        # 2. Plot settings for Depletion/Burnup data
+        self.tally_plot_dialog.depletion_controls = QWidget()
+        dep_layout = QHBoxLayout(self.tally_plot_dialog.depletion_controls)
+        dep_layout.setContentsMargins(0, 0, 0, 0)
+
+        dep_layout.addWidget(QLabel("<b>X-Axis:</b>"))
+        self.tally_plot_dialog.combo_dep_x = QComboBox()
+        self.tally_plot_dialog.combo_dep_x.addItems(["Time (Days)", "Burnup (MWd/kgHM)"])
+        self.tally_plot_dialog.combo_dep_x.currentIndexChanged.connect(self._plot_depletion_data)
+        dep_layout.addWidget(self.tally_plot_dialog.combo_dep_x)
+
+        dep_layout.addWidget(QLabel("<b>Y-Axis:</b>"))
+        self.tally_plot_dialog.combo_dep_y = QComboBox()
+        self.tally_plot_dialog.combo_dep_y.currentIndexChanged.connect(self._plot_depletion_data)
+        dep_layout.addWidget(self.tally_plot_dialog.combo_dep_y)
+
+        # Material selector: summing every depletable material together hides
+        # the behaviour of each individual region (different fuel zones burn at
+        # very different rates), so the material is selectable and the total is
+        # only the default.
+        dep_layout.addWidget(QLabel("<b>Material:</b>"))
+        self.tally_plot_dialog.combo_dep_mat = QComboBox()
+        self.tally_plot_dialog.combo_dep_mat.setToolTip(
+            "Which depletable material to trace.\n"
+            "'All materials (sum)' adds every region together, which can hide\n"
+            "how an individual fuel zone actually behaves.")
+        self.tally_plot_dialog.combo_dep_mat.currentIndexChanged.connect(self._plot_depletion_data)
+        dep_layout.addWidget(self.tally_plot_dialog.combo_dep_mat)
+
+        plot_controls.addWidget(self.tally_plot_dialog.depletion_controls)
+        self.tally_plot_dialog.depletion_controls.setVisible(False)
+
+        self.tally_plot_dialog.btn_refresh = QPushButton("🔄 Refresh Plot")
+        self.tally_plot_dialog.btn_refresh.setStyleSheet(
+            "background-color: #0e639c; color: white; padding: 6px; font-weight: bold;")
+        self.tally_plot_dialog.btn_refresh.clicked.connect(self._refresh_active_plot)
+        plot_controls.addWidget(self.tally_plot_dialog.btn_refresh)
+
+        self.tally_plot_dialog.btn_save = QPushButton("💾 Save Plot")
+        self.tally_plot_dialog.btn_save.clicked.connect(self._save_tally_plot)
+        plot_controls.addWidget(self.tally_plot_dialog.btn_save)
+
+        self.tally_plot_dialog.btn_export = QPushButton("📊 Export Plot Data to Excel/CSV")
+        self.tally_plot_dialog.btn_export.setStyleSheet(
+            "background-color: #d97706; color: white; padding: 6px; font-weight: bold;")
+        self.tally_plot_dialog.btn_export.clicked.connect(self.export_plot_to_excel)
+        plot_controls.addWidget(self.tally_plot_dialog.btn_export)
+
+        plot_controls.addStretch()
+        layout.addLayout(plot_controls)
+
+        self.tally_plot_dialog.status_label = QLabel("Select a Tally from the main window to display its result.")
+        self.tally_plot_dialog.status_label.setStyleSheet("color: #666666; font-style: italic; font-weight: normal;")
+        layout.addWidget(self.tally_plot_dialog.status_label)
+
+        # Plot area
+        self.tally_plot_dialog.figure = Figure(tight_layout=True)
+        self.tally_plot_dialog.canvas = FigureCanvas(self.tally_plot_dialog.figure)
+        self.tally_plot_dialog.ax = self.tally_plot_dialog.figure.add_subplot(111)
+        self.tally_plot_dialog.toolbar = NavigationToolbar(self.tally_plot_dialog.canvas, self.tally_plot_dialog)
+
+        layout.addWidget(self.tally_plot_dialog.toolbar)
+        layout.addWidget(self.tally_plot_dialog.canvas)
+
     def _setup_hpge_dialog(self):
-        """إعداد النافذة المنبثقة الواسعة لأدوات الجرمانيوم"""
+        """Setup HPGe tools popup window"""
         self.hpge_dialog = QDialog(self)
         self.hpge_dialog.setWindowTitle("☢️ Advanced HPGe Spectral Analysis")
         self.hpge_dialog.setMinimumSize(900, 600)
@@ -214,7 +292,7 @@ class ResultsPageWidget(QWidget):
 
         hpge_layout = QVBoxLayout(self.hpge_dialog)
 
-        # --- مجموعة 1: الرسم و الـ GEB ---
+        # --- Group 1: Plotting & GEB ---
         plot_group = QGroupBox("1. Spectrum Plotting & GEB Calibration")
         plot_group.setStyleSheet("font-weight: bold; font-size: 13px; color: #0e639c;")
         plot_layout = QHBoxLayout(plot_group)
@@ -240,7 +318,7 @@ class ResultsPageWidget(QWidget):
         plot_layout.addStretch()
         hpge_layout.addWidget(plot_group)
 
-        # --- مجموعة 2: تحليل القمم وتحديد النظائر ---
+        # --- Group 2: Peak Analysis & Isotopes ---
         analysis_group = QGroupBox("2. Peak Fitting & Efficiency (FEPE)")
         analysis_group.setStyleSheet("font-weight: bold; font-size: 13px; color: #8e44ad;")
         analysis_layout = QHBoxLayout(analysis_group)
@@ -269,7 +347,7 @@ class ResultsPageWidget(QWidget):
         analysis_layout.addStretch()
         hpge_layout.addWidget(analysis_group)
 
-        # --- جدول النتائج ---
+        # --- Results Table ---
         self.table_peaks = QTableWidget()
         self.table_peaks.setColumnCount(6)
         self.table_peaks.setHorizontalHeaderLabels(
@@ -277,6 +355,18 @@ class ResultsPageWidget(QWidget):
         self.table_peaks.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_peaks.setStyleSheet("font-weight: normal; font-size: 13px; color: black;")
         hpge_layout.addWidget(self.table_peaks)
+
+    def open_tally_plot_window(self):
+        self.tally_plot_dialog.show()
+        self.tally_plot_dialog.raise_()
+        self.tally_plot_dialog.activateWindow()
+        self._refresh_active_plot()
+
+    def _refresh_active_plot(self):
+        if self.tally_plot_dialog.depletion_controls.isVisible():
+            self._plot_depletion_data()
+        else:
+            self._plot_selected_tally()
 
     def show_hpge_dialog(self):
         self.hpge_dialog.show()
@@ -317,18 +407,16 @@ class ResultsPageWidget(QWidget):
             self.process_statepoint(file_path)
 
     def _process_depletion_results(self, filepath):
-        """قراءة ملف الاستنزاف من جذوره الخام باستخدام h5py بفصل آمن للبيانات"""
+        """Analyze depletion file securely using 100% native h5py (Bypassing Windows GUI crash)."""
         try:
             with h5py.File(filepath, 'r') as f:
                 if 'eigenvalues' not in f or 'time' not in f:
                     raise ValueError(
                         "Not a valid OpenMC depletion results file (missing 'eigenvalues' or 'time' datasets).")
 
-                # --- 1. استخراج معامل التكاثر والخطأ الإحصائي بشكل مفصول تماماً ---
+                # 1. Extract K-effective
                 k_data = np.array(f['eigenvalues'])
-
                 if k_data.ndim == 1:
-                    # إذا كانت مصفوفة مُهيكلة (Structured Array) كقوائم (k, err)
                     if k_data.dtype.names is not None:
                         k_val = k_data[k_data.dtype.names[0]]
                         k_err = k_data[k_data.dtype.names[1]] if len(k_data.dtype.names) > 1 else np.zeros_like(k_val)
@@ -336,7 +424,6 @@ class ResultsPageWidget(QWidget):
                         k_val = k_data
                         k_err = np.zeros_like(k_val)
                 else:
-                    # إذا كانت 2D أو 3D مثل (N, 2) أو (N, 1, 2)
                     if k_data.shape[-1] >= 2:
                         k_val = k_data[..., 0].flatten()
                         k_err = k_data[..., 1].flatten()
@@ -344,83 +431,308 @@ class ResultsPageWidget(QWidget):
                         k_val = k_data[..., 0].flatten()
                         k_err = np.zeros_like(k_val)
 
-                # --- 2. استخراج الزمن بشكل متوافق ---
+                # 2. Extract Time
                 time_data = np.array(f['time'])
-
                 if time_data.ndim == 2 and time_data.shape[1] == 2:
-                    # النمط القديم: كل خطوة عبارة عن (بداية، نهاية)
                     time_s = np.append(time_data[:, 0], time_data[-1, 1])
                 else:
-                    # النمط الحديث: مصفوفة أزمنة مباشرة [0, 10, 20]
                     time_s = time_data.flatten()
-
                 time_days = time_s / (24 * 60 * 60)
 
-            # --- 3. توحيد وحماية الأطوال (Safeguard) ---
-            min_len = min(len(time_days), len(k_val))
-            time_days = time_days[:min_len]
-            k_val = k_val[:min_len]
-            k_err = k_err[:min_len]
+                min_len = min(len(time_days), len(k_val))
+                time_days = time_days[:min_len]
+                k_val = k_val[:min_len]
+                k_err = k_err[:min_len]
 
-            # تحويلات صريحة لحماية الواجهة
-            final_k = float(k_val[-1])
-            final_err = float(k_err[-1])
+                # 3. Extract Burnup OR calculate Energy (MWd)
+                burnup_data = None
+                self._x_is_energy = False
+                if 'burnup' in f:
+                    b_data = np.array(f['burnup'])
+                    if b_data.ndim > 1:
+                        burnup_data = b_data.sum(axis=1)
+                    else:
+                        burnup_data = b_data
+                    burnup_data = burnup_data[:min_len]
+                elif 'source_rate' in f:
+                    try:
+                        power_W = np.array(f['source_rate']).flatten()
+                        power_MW = power_W / 1e6
+                        if len(power_MW) > 0:
+                            dt_days = np.diff(time_days)
+                            energy_MWd = np.zeros(len(time_days))
+                            energy_MWd[1:] = np.cumsum(power_MW[:len(dt_days)] * dt_days)
+                            burnup_data = energy_MWd
+                            self._x_is_energy = True
+                    except Exception:
+                        pass
 
-            self.lbl_keff.setText(f"Final k-effective = {final_k:.5f} ± {final_err:.5f}")
-            self.lbl_keff.setStyleSheet("font-size: 26px; font-weight: bold; color: #d35400; padding: 20px;")
+                # 4. Extract nuclide / material indices and the atom inventory.
+                #
+                # The layout openmc.deplete actually writes is:
+                #     /nuclides/<name>     Group -> attrs['atom number index']
+                #     /materials/<mat_id>  Group -> attrs['index'], attrs['volume']
+                #     /number              Dataset (steps, stages, materials, nuclides)
+                #
+                # Two things worth spelling out, because both silently break the
+                # isotope curves if assumed otherwise:
+                #   * /nuclides is a GROUP whose SUBGROUP NAMES are the nuclide
+                #     names -- it is not a string Dataset. Testing it with
+                #     isinstance(..., h5py.Dataset) therefore never matches and
+                #     the isotope list comes back empty, leaving the Y-axis
+                #     dropdown with nothing to choose from.
+                #   * /number has FOUR dimensions, not three. Used as-is,
+                #     atoms[:, idx] returns a 3-D slab instead of a single curve.
+                nuc_index = {}
+                mat_index = {}
+                atoms_by_mat = None
 
-            # تهيئة القوائم المنسدلة
-            self.combo_tallies.blockSignals(True)
-            self.combo_tallies.clear()
-            self.combo_tallies.addItem("Depletion Results (k-eff vs Time)", -1)
-            self.combo_tallies.blockSignals(False)
-            self.btn_open_hpge.setVisible(False)
+                try:
+                    if 'nuclides' in f and isinstance(f['nuclides'], h5py.Group):
+                        for _name, _node in f['nuclides'].items():
+                            _idx = _node.attrs.get('atom number index',
+                                                   _node.attrs.get('index'))
+                            if _idx is not None:
+                                nuc_index[str(_name)] = int(_idx)
 
-            # ملء الجدول
-            self.table_tally.setRowCount(len(time_days))
-            self.table_tally.setColumnCount(3)
-            self.table_tally.setHorizontalHeaderLabels(["Time [Days]", "k-effective", "Std Dev"])
-            self.table_tally.setUpdatesEnabled(False)
+                    if 'materials' in f and isinstance(f['materials'], h5py.Group):
+                        for _name, _node in f['materials'].items():
+                            _idx = _node.attrs.get('index')
+                            if _idx is not None:
+                                mat_index[str(_name)] = int(_idx)
 
-            for row in range(len(time_days)):
-                t_val = float(time_days[row])
-                kv = float(k_val[row])
-                ke = float(k_err[row])
+                    if 'number' in f and isinstance(f['number'], h5py.Dataset):
+                        _num = np.array(f['number'], dtype=float)
+                        if _num.ndim == 4:
+                            atoms_by_mat = _num[:, 0, :, :]      # first stage
+                        elif _num.ndim == 3:
+                            atoms_by_mat = _num
+                        elif _num.ndim == 2:
+                            atoms_by_mat = _num[:, None, :]
+                        if atoms_by_mat is not None:
+                            atoms_by_mat = atoms_by_mat[:min_len]
 
-                item_time = QTableWidgetItem(f"{t_val:.2f}")
-                item_k = QTableWidgetItem(f"{kv:.5f}")
-                item_err = QTableWidgetItem(f"{ke:.5f}")
+                except Exception as ex:
+                    self._log(f"⚠️ Notice: minor issue while extracting isotope counts: {ex}")
 
-                item_time.setFlags(item_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item_k.setFlags(item_k.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item_err.setFlags(item_err.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # Ordered by the index stored in the file, so a name's position
+                # in this list always matches its column in atoms_by_mat.
+                nuclides = sorted(nuc_index, key=lambda _n: nuc_index[_n])
+                materials = sorted(mat_index, key=lambda _m: mat_index[_m])
 
-                self.table_tally.setItem(row, 0, item_time)
-                self.table_tally.setItem(row, 1, item_k)
-                self.table_tally.setItem(row, 2, item_err)
+                # 5. Real burnup (MWd/kgHM).
+                #
+                # The energy computed above is MWd -- it only becomes burnup
+                # after dividing by the initial heavy-metal mass. That mass is
+                # already implicit in the file (the step-0 actinide inventory),
+                # so it is derived from the results themselves rather than asked
+                # of the user or re-read from the script: a mass taken from the
+                # script could belong to a model that has since been edited,
+                # whereas this one is guaranteed to match the run that produced
+                # these numbers.
+                hm_mass_kg = 0.0
+                hm_mass_by_mat = {}
+                if atoms_by_mat is not None and atoms_by_mat.ndim == 3 and len(atoms_by_mat):
+                    initial = atoms_by_mat[0]                       # (materials, nuclides)
+                    for _m, _mi in mat_index.items():
+                        if _mi < initial.shape[0]:
+                            hm_mass_by_mat[_m] = _heavy_metal_mass_kg(initial[_mi], nuc_index)
+                    hm_mass_kg = float(sum(hm_mass_by_mat.values()))
 
-            self.table_tally.setUpdatesEnabled(True)
+                if burnup_data is not None and hm_mass_kg > 0 and self._x_is_energy:
+                    burnup_data = np.asarray(burnup_data, dtype=float) / hm_mass_kg
+                    self._x_is_energy = False                        # now genuine MWd/kgHM
+                    self._log(f"✅ Burnup axis available: initial heavy-metal mass "
+                              f"= {hm_mass_kg:.4g} kg (from the step-0 actinide inventory).")
+                elif self._x_is_energy:
+                    self._log("ℹ️ No heavy metal found in the inventory -- the burnup axis will "
+                              "show total energy produced (MWd) instead of MWd/kgHM.")
 
-            # رسم المنحنى المدمج
-            self._clear_tally_plot()
-            ax = self._tally_ax
-            ax.errorbar(time_days, k_val, yerr=k_err, marker='o', linestyle='-',
-                        color='#d35400', ecolor='red', capsize=5, markersize=6, linewidth=2, label='k-effective')
-            ax.set_title('Reactor k-effective vs. Depletion Time', fontsize=12, fontweight='bold')
-            ax.set_xlabel('Time (Days)', fontsize=10, fontweight='bold')
-            ax.set_ylabel('k-effective', fontsize=10, fontweight='bold')
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.legend(loc='best')
+                # Store data for plotting
+                self._depletion_data = {
+                    'time_days': time_days,
+                    'burnup': burnup_data,
+                    'k_val': k_val,
+                    'k_err': k_err,
+                    'nuclides': nuclides,
+                    'materials': materials,
+                    'nuc_index': nuc_index,
+                    'mat_index': mat_index,
+                    'atoms_by_mat': atoms_by_mat,
+                    'hm_mass_kg': hm_mass_kg,
+                    'hm_mass_by_mat': hm_mass_by_mat
+                }
 
-            self._tally_figure.tight_layout()
-            self._tally_canvas.draw_idle()
+                # --- Update UI ---
+                final_k = float(k_val[-1])
+                final_err = float(k_err[-1])
 
-            self.tally_plot_status.setText(f"✅ Depletion results loaded directly from: {os.path.basename(filepath)}")
-            self._log(f"✅ Depletion data plotted natively! ({len(time_days)} matched time points analyzed)")
+                self.lbl_keff.setText(f"Final k-effective = {final_k:.5f} ± {final_err:.5f}")
+                self.lbl_keff.setStyleSheet("font-size: 26px; font-weight: bold; color: #d35400; padding: 20px;")
+
+                self.combo_tallies.blockSignals(True)
+                self.combo_tallies.clear()
+                self.combo_tallies.addItem("Depletion Results", -1)
+                self.combo_tallies.blockSignals(False)
+                self.btn_open_hpge.setVisible(False)
+
+                # Populate K-eff and Time table
+                self.table_tally.setRowCount(len(time_days))
+                self.table_tally.setColumnCount(3)
+                self.table_tally.setHorizontalHeaderLabels(["Time [Days]", "k-effective", "Std Dev"])
+                self.table_tally.setUpdatesEnabled(False)
+
+                for row in range(len(time_days)):
+                    item_time = QTableWidgetItem(f"{time_days[row]:.4f}")
+                    item_k = QTableWidgetItem(f"{k_val[row]:.5f}")
+                    item_err = QTableWidgetItem(f"{k_err[row]:.5f}")
+
+                    item_time.setFlags(item_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    item_k.setFlags(item_k.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    item_err.setFlags(item_err.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                    self.table_tally.setItem(row, 0, item_time)
+                    self.table_tally.setItem(row, 1, item_k)
+                    self.table_tally.setItem(row, 2, item_err)
+                self.table_tally.setUpdatesEnabled(True)
+
+                # Update independent plot window settings
+                self.tally_plot_dialog.combo_plot_type.setVisible(False)
+                self.tally_plot_dialog.depletion_controls.setVisible(True)
+
+                # Setup smart isotope list (Y-Axis)
+                self.tally_plot_dialog.combo_dep_y.blockSignals(True)
+                self.tally_plot_dialog.combo_dep_y.clear()
+                self.tally_plot_dialog.combo_dep_y.addItem("k-effective", "k-effective")
+
+                popular_isotopes = ['U235', 'Pu239', 'Xe135', 'Sm149', 'U238', 'O16']
+                added = set()
+                if nuclides:
+                    # Priority isotopes at the top
+                    for p in popular_isotopes:
+                        if p in nuclides:
+                            self.tally_plot_dialog.combo_dep_y.addItem(f"Atoms: {p}", p)
+                            added.add(p)
+
+                    if added:
+                        self.tally_plot_dialog.combo_dep_y.insertSeparator(
+                            self.tally_plot_dialog.combo_dep_y.count())
+
+                    # Remaining isotopes
+                    for nuc in nuclides:
+                        if nuc not in added:
+                            self.tally_plot_dialog.combo_dep_y.addItem(f"Atoms: {nuc}", nuc)
+
+                self.tally_plot_dialog.combo_dep_y.blockSignals(False)
+
+                # Populate the material selector ("All" first, then each one)
+                self.tally_plot_dialog.combo_dep_mat.blockSignals(True)
+                self.tally_plot_dialog.combo_dep_mat.clear()
+                self.tally_plot_dialog.combo_dep_mat.addItem("All materials (sum)", None)
+                for _m in materials:
+                    self.tally_plot_dialog.combo_dep_mat.addItem(f"Material {_m}", _m)
+                self.tally_plot_dialog.combo_dep_mat.setEnabled(bool(materials))
+                self.tally_plot_dialog.combo_dep_mat.blockSignals(False)
+
+                if not nuclides:
+                    self._log("ℹ️ No nuclide inventory found in this depletion file -- "
+                              "only k-effective can be plotted.")
+                else:
+                    self._log(f"✅ Depletion inventory loaded: {len(nuclides)} nuclide(s) "
+                              f"across {len(materials)} material(s).")
+
+                # Plot data immediately and open window
+                self._plot_depletion_data()
+                self.open_tally_plot_window()
 
         except Exception as e:
             QMessageBox.critical(self, "Depletion Read Error", f"Could not read depletion file:\n{str(e)}")
             self._log(f"⚠️ Depletion analysis error: {e}")
+
+    def _plot_depletion_data(self):
+        """Plot depletion, burnup, and isotope data"""
+        if not hasattr(self, '_depletion_data') or not self._depletion_data:
+            return
+
+        time_days = self._depletion_data['time_days']
+        burnup_data = self._depletion_data.get('burnup')
+        k_val = self._depletion_data['k_val']
+        k_err = self._depletion_data['k_err']
+        nuc_index = self._depletion_data.get('nuc_index', {})
+        mat_index = self._depletion_data.get('mat_index', {})
+        atoms_by_mat = self._depletion_data.get('atoms_by_mat', None)
+
+        x_mode = self.tally_plot_dialog.combo_dep_x.currentText()
+        y_mode = self.tally_plot_dialog.combo_dep_y.currentData()
+        y_text = self.tally_plot_dialog.combo_dep_y.currentText()
+
+        # Setup X-Axis
+        if "Burnup" in x_mode:
+            if burnup_data is not None:
+                x_data = burnup_data
+                if getattr(self, '_x_is_energy', False):
+                    # Energy only -- no heavy metal was found to divide by, so
+                    # say so rather than mislabel megawatt-days as burnup.
+                    x_label = 'Energy Produced (MWd) - [no heavy metal found]'
+                else:
+                    hm = self._depletion_data.get('hm_mass_kg', 0.0)
+                    x_label = (f'Burnup (MWd/kgHM)  [m_HM = {hm:.4g} kg]'
+                               if hm else 'Burnup (MWd/kgHM)')
+            else:
+                x_data = time_days
+                x_label = 'Time (Days) - [Burnup data missing in file]'
+        else:
+            x_data = time_days
+            x_label = 'Time (Days)'
+
+        self._clear_tally_plot()
+        ax = self.tally_plot_dialog.ax
+
+        # Setup Y-Axis
+        if y_mode == "k-effective":
+            ax.errorbar(x_data, k_val, yerr=k_err, marker='o', linestyle='-',
+                        color='#d35400', ecolor='red', capsize=5, markersize=6, linewidth=2, label='k-effective')
+            ax.set_ylabel('k-effective', fontsize=10, fontweight='bold')
+            ax.set_title('Reactor k-effective vs. Depletion', fontsize=12, fontweight='bold')
+        else:
+            nuc_name = y_mode
+            mat_sel = self.tally_plot_dialog.combo_dep_mat.currentData()
+
+            y_data = None
+            scope = None
+            if atoms_by_mat is not None and nuc_name in nuc_index:
+                ni = nuc_index[nuc_name]
+                if atoms_by_mat.ndim == 3 and atoms_by_mat.shape[2] > ni:
+                    if mat_sel is None:
+                        y_data = atoms_by_mat[:, :, ni].sum(axis=1)
+                        scope = "all materials"
+                    elif mat_sel in mat_index:
+                        y_data = atoms_by_mat[:, mat_index[mat_sel], ni]
+                        scope = f"material {mat_sel}"
+
+            if y_data is not None:
+                ax.plot(x_data, y_data, marker='s', linestyle='-', color='#0e639c',
+                        markersize=6, linewidth=2, label=f'{nuc_name} ({scope})')
+                ax.set_ylabel(f'Atoms of {nuc_name}', fontsize=10, fontweight='bold')
+                ax.set_title(f'Evolution of {nuc_name} vs. Depletion — {scope}',
+                             fontsize=12, fontweight='bold')
+                # Log scale only when it genuinely helps AND nothing would break
+                # it: a bred nuclide such as Pu239 legitimately starts at 0.
+                positive = y_data[y_data > 0]
+                if positive.size and y_data.max() / positive.min() > 100 and y_data.min() > 0:
+                    ax.set_yscale('log')
+            else:
+                ax.text(0.5, 0.5, f"No inventory data available for {nuc_name}",
+                        ha='center', va='center', transform=ax.transAxes)
+
+        ax.set_xlabel(x_label, fontsize=10, fontweight='bold')
+        ax.grid(True, linestyle='--', alpha=0.7)
+        if ax.lines or ax.containers:
+            ax.legend(loc='best')
+
+        self.tally_plot_dialog.figure.tight_layout()
+        self.tally_plot_dialog.canvas.draw_idle()
+        self.tally_plot_dialog.status_label.setText(f"✅ Plotted {y_text} against {x_label}.")
 
     def process_statepoint(self, filepath):
         try:
@@ -431,7 +743,6 @@ class ResultsPageWidget(QWidget):
                     pass
             self.sp = None
 
-            # --- التوجيه التلقائي الذكي لملفات الاستنزاف ---
             if "depletion_results" in os.path.basename(filepath).lower():
                 self._process_depletion_results(filepath)
                 return
@@ -479,9 +790,18 @@ class ResultsPageWidget(QWidget):
             return
 
         if tally_id == -1:
-            # ملف استنزاف، تم التعامل معه مسبقاً، نتجاهل هذه الخطوة
             self.btn_open_hpge.setVisible(False)
+            if hasattr(self.tally_plot_dialog, 'depletion_controls'):
+                self.tally_plot_dialog.combo_plot_type.setVisible(False)
+                self.tally_plot_dialog.depletion_controls.setVisible(True)
+                if self.tally_plot_dialog.isVisible():
+                    self._plot_depletion_data()
             return
+
+        # Restore normal tally settings
+        if hasattr(self.tally_plot_dialog, 'depletion_controls'):
+            self.tally_plot_dialog.depletion_controls.setVisible(False)
+            self.tally_plot_dialog.combo_plot_type.setVisible(True)
 
         if not self.sp or index < 0 or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
             self.btn_open_hpge.setVisible(False)
@@ -496,12 +816,10 @@ class ResultsPageWidget(QWidget):
             else:
                 self.btn_open_hpge.setVisible(False)
 
-            # --- الخطة البديلة (Fallback) للتعامل مع الانهيار ---
             try:
                 df = tally.get_pandas_dataframe()
             except Exception as e_df:
                 self._log(f"⚠️ OpenMC failed to parse Pandas DataFrame ({e_df}). Using generic raw data display.")
-                # استخراج البيانات الخام كخطة بديلة
                 df = pd.DataFrame()
                 if hasattr(tally, 'mean'):
                     try:
@@ -535,9 +853,8 @@ class ResultsPageWidget(QWidget):
                     for col in range(df_preview.shape[1]):
                         val = df_preview.iloc[row, col]
 
-                        # إضلاح خطأ pandas المتصل بـ Ragged Arrays
                         if isinstance(val, (list, tuple, np.ndarray)):
-                            val_str = str(val)  # تحويل آمن 100% للنص بدون المرور بمصفوفات NumPy
+                            val_str = str(val)
                         elif isinstance(val, (float, np.floating)) and pd.isna(val):
                             val_str = "NaN"
                         elif isinstance(val, (float, np.floating)):
@@ -555,26 +872,18 @@ class ResultsPageWidget(QWidget):
                 self._log(f"ℹ️ Tally preview showing the first {max_preview_rows} of {df.shape[0]} rows "
                           f"-- use 'Export to CSV' for the complete data.")
 
-            self._plot_selected_tally()
+            if self.tally_plot_dialog.isVisible():
+                self._plot_selected_tally()
+
         except Exception as e:
             self._log(f"⚠️ Could not display tally data: {e}")
 
     # ==========================================================
-    # --- Automatic Tally Visualization ---
+    # --- Advanced Window Plot Logic ---
     # ==========================================================
-    def _ensure_tally_canvas(self):
-        if self._tally_canvas is not None:
-            return
-
-        self._tally_figure = Figure(figsize=(8, 4.2), tight_layout=True)
-        self._tally_canvas = FigureCanvas(self._tally_figure)
-        self._tally_ax = self._tally_figure.add_subplot(111)
-        self.tally_plot_layout.addWidget(self._tally_canvas)
-
     def _clear_tally_plot(self):
-        self._ensure_tally_canvas()
-        self._tally_figure.clear()
-        self._tally_ax = self._tally_figure.add_subplot(111)
+        self.tally_plot_dialog.figure.clear()
+        self.tally_plot_dialog.ax = self.tally_plot_dialog.figure.add_subplot(111)
 
     def _get_tally_filter_names(self, tally):
         names = []
@@ -597,7 +906,6 @@ class ResultsPageWidget(QWidget):
 
         tally_id = self.combo_tallies.currentData()
         if tally_id is None or tally_id == -1:
-            # ملف الاستنزاف قد تم رسمه بالفعل
             return
 
         if not self.sp or not hasattr(self.sp, "tallies") or not self.sp.tallies:
@@ -605,7 +913,7 @@ class ResultsPageWidget(QWidget):
 
         try:
             tally = self.sp.tallies[tally_id]
-            requested = self.combo_tally_plot_type.currentText()
+            requested = self.tally_plot_dialog.combo_plot_type.currentText()
             filters = self._get_tally_filter_names(tally)
 
             mesh_filter = self._find_mesh_filter(tally)
@@ -627,7 +935,7 @@ class ResultsPageWidget(QWidget):
 
             raw_mean = np.squeeze(raw_mean)
             if raw_mean.size == 0:
-                self.tally_plot_status.setText(
+                self.tally_plot_dialog.status_label.setText(
                     "No numerical data available for the selected Tally."
                 )
                 return
@@ -646,14 +954,14 @@ class ResultsPageWidget(QWidget):
             y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
             if np.all(y == 0.0):
-                self.tally_plot_status.setText(
+                self.tally_plot_dialog.status_label.setText(
                     "The selected Tally has no numerical values to plot."
                 )
                 return
 
             y_col = score
             self._clear_tally_plot()
-            ax = self._tally_ax
+            ax = self.tally_plot_dialog.ax
 
             energy_filter = self._find_energy_filter_for_plot(tally)
             auto_energy = requested == "Auto" and energy_filter is not None
@@ -685,16 +993,16 @@ class ResultsPageWidget(QWidget):
                 ax.set_title(f"Tally {tally_id} — {tally.name or 'Result'}")
                 ax.grid(True, axis="y", alpha=0.25)
 
-            self._tally_figure.tight_layout()
-            self._tally_canvas.draw_idle()
+            self.tally_plot_dialog.figure.tight_layout()
+            self.tally_plot_dialog.canvas.draw_idle()
 
-            self.tally_plot_status.setText(
+            self.tally_plot_dialog.status_label.setText(
                 f"Showing: Tally {tally_id} | Score: {y_col} | "
                 f"Filters: {', '.join(filters) if filters else 'Global'}"
             )
 
         except Exception as e:
-            self.tally_plot_status.setText(f"Plot unavailable: {e}")
+            self.tally_plot_dialog.status_label.setText(f"Plot unavailable: {e}")
             self._log(f"⚠️ Automatic tally plot failed: {e}")
 
     def _plot_tally_mesh_embedded(self, tally, tally_id, mesh_filter):
@@ -720,7 +1028,6 @@ class ResultsPageWidget(QWidget):
                 arr = np.squeeze(arr)
             except (AttributeError, TypeError, ValueError):
                 try:
-                    # حماية من انهيارات المصفوفات المعقدة
                     arr = np.asarray(tslice.mean, dtype=float).reshape(-1)
                 except Exception:
                     return False
@@ -731,7 +1038,7 @@ class ResultsPageWidget(QWidget):
             arr = np.squeeze(arr)
             non_unit_axes = [i for i, d in enumerate(dims) if d > 1]
             self._clear_tally_plot()
-            ax = self._tally_ax
+            ax = self.tally_plot_dialog.ax
 
             if arr.ndim <= 1 or len(non_unit_axes) <= 1:
                 axis = non_unit_axes[0] if non_unit_axes else 0
@@ -763,7 +1070,7 @@ class ResultsPageWidget(QWidget):
                     extent=extent,
                     aspect="auto"
                 )
-                self._tally_figure.colorbar(
+                self.tally_plot_dialog.figure.colorbar(
                     im, ax=ax, label=f"{score} [per source particle]"
                 )
                 labels = ["X", "Y", "Z"]
@@ -771,9 +1078,9 @@ class ResultsPageWidget(QWidget):
                 ax.set_ylabel(f"{labels[v_axis]} [cm]")
                 ax.set_title(f"Mesh Tally {tally_id} — {score}{suffix}")
 
-            self._tally_figure.tight_layout()
-            self._tally_canvas.draw_idle()
-            self.tally_plot_status.setText(
+            self.tally_plot_dialog.figure.tight_layout()
+            self.tally_plot_dialog.canvas.draw_idle()
+            self.tally_plot_dialog.status_label.setText(
                 f"Showing Mesh Tally {tally_id} | Score: {score} | "
                 f"Dimensions: {dims}"
             )
@@ -784,7 +1091,7 @@ class ResultsPageWidget(QWidget):
             return False
 
     def _save_tally_plot(self):
-        if self._tally_figure is None:
+        if self.tally_plot_dialog.figure is None:
             QMessageBox.information(
                 self, "Save Plot", "Generate a Tally plot first."
             )
@@ -804,10 +1111,10 @@ class ResultsPageWidget(QWidget):
             return
 
         try:
-            self._tally_figure.savefig(
+            self.tally_plot_dialog.figure.savefig(
                 save_path, dpi=200, bbox_inches="tight"
             )
-            self.tally_plot_status.setText(
+            self.tally_plot_dialog.status_label.setText(
                 f"✅ Plot saved: {os.path.basename(save_path)}"
             )
         except Exception as e:
@@ -816,28 +1123,26 @@ class ResultsPageWidget(QWidget):
             )
 
     def export_plot_to_excel(self):
-        if not hasattr(self, '_current_ax') and not hasattr(self, '_tally_ax'):
-            QMessageBox.warning(self, "Warning", "No plot available to export.")
-            return
-
         ax = None
         if hasattr(self, 'hpge_dialog') and self.hpge_dialog.isVisible() and self._current_ax is not None:
             ax = self._current_ax
-        elif hasattr(self, '_tally_ax') and self._tally_ax is not None:
-            ax = self._tally_ax
+        elif hasattr(self,
+                     'tally_plot_dialog') and self.tally_plot_dialog.isVisible() and self.tally_plot_dialog.ax is not None:
+            ax = self.tally_plot_dialog.ax
+        else:
+            QMessageBox.warning(self, "Warning", "No active plot window is open to export data from.")
+            return
 
         if ax is None or (not ax.lines and not ax.patches):
             QMessageBox.warning(self, "Warning", "No line or bar data found in the current plot.")
             return
 
         data_dict = {}
-        # استخراج بيانات الخطوط (مثل أطياف الجرمانيوم أو Line Plots)
         for i, line in enumerate(ax.lines):
             label = line.get_label() if line.get_label() and not line.get_label().startswith('_') else f"Line_{i + 1}"
             data_dict[f"{label}_X"] = line.get_xdata()
             data_dict[f"{label}_Y"] = line.get_ydata()
 
-        # استخراج بيانات الأعمدة (مثل Bar charts للعدادات)
         if ax.patches:
             x_vals = [p.get_x() + p.get_width() / 2 for p in ax.patches]
             y_vals = [p.get_height() for p in ax.patches]
@@ -849,7 +1154,6 @@ class ResultsPageWidget(QWidget):
             return
 
         try:
-            # دمج البيانات في جدول (مع التعامل مع الأطوال المختلفة إن وجدت)
             df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in data_dict.items()]))
             save_path, _ = QFileDialog.getSaveFileName(self, "Save Plot Data to Excel/CSV",
                                                        os.path.join(os.getcwd(), "Plot_Raw_Data.csv"),
@@ -864,7 +1168,6 @@ class ResultsPageWidget(QWidget):
     def export_to_csv(self):
         tally_id = self.combo_tallies.currentData()
 
-        # --- تعديل لاستخراج بيانات الاستنزاف إذا كانت معروضة ---
         if tally_id == -1:
             try:
                 rows = self.table_tally.rowCount()
@@ -1254,7 +1557,6 @@ class ResultsPageWidget(QWidget):
         if not code.strip():
             raise ValueError("Script is empty.")
 
-        # حماية ضد تجميد الواجهة: إزالة أو استبدال أوامر المحاكاة من الكود
         code = re.sub(r'\bopenmc\.run\s*\(\s*\)', 'pass', code)
         code = re.sub(r'\bopenmc\.plot_geometry\s*\(\s*\)', 'pass', code)
 
