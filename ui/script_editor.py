@@ -2,7 +2,7 @@ import os
 import re
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QPlainTextEdit, QFileDialog, QMessageBox
+    QPlainTextEdit, QFileDialog, QMessageBox, QInputDialog, QLineEdit
 )
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QFont, QColor, QTextCharFormat, QSyntaxHighlighter
@@ -134,6 +134,41 @@ class ScriptEditorWidget(QWidget):
 
     def run_script(self):
         code = self.editor.toPlainText()
+
+        # --- ميزة حماية الملفات وإعادة التسمية التلقائية (Auto-Renaming) ---
+        sim_name, ok = QInputDialog.getText(
+            self, "Simulation Name",
+            "Enter a name for this simulation (to protect output files from being overwritten):",
+            QLineEdit.EchoMode.Normal, "MyReactor_Sim"
+        )
+
+        # إذا أدخل المستخدم اسماً، نقوم بإضافة كود مخفي في نهاية السكربت لإعادة تسمية الملفات
+        if ok and sim_name.strip():
+            safe_name = re.sub(r'\W', '_', sim_name.strip())  # تعقيم الاسم برمجياً
+            rename_code_snippet = f"""
+# --- OpenMC Studio Auto-Rename Protection ---
+import os
+import glob
+try:
+    prefix = '{safe_name}'
+    # تغيير اسم ملف الاستنزاف
+    if os.path.exists('depletion_results.h5'):
+        os.rename('depletion_results.h5', f'{{prefix}}_depletion_results.h5')
+        print(f'\\n[OpenMC Studio] ✅ Protected: depletion_results.h5 -> {{prefix}}_depletion_results.h5')
+
+    # تغيير اسم ملفات الـ Statepoint
+    for sp_file in glob.glob('statepoint.*.h5'):
+        if not sp_file.startswith(prefix):
+            os.rename(sp_file, f'{{prefix}}_{{sp_file}}')
+            print(f'[OpenMC Studio] ✅ Protected: {{sp_file}} -> {{prefix}}_{{sp_file}}')
+except Exception as e:
+    print(f'[OpenMC Studio] ⚠️ Warning: Auto-rename failed: {{e}}')
+"""
+            code_to_run = code + "\n" + rename_code_snippet
+        else:
+            # إذا لم يُدخل اسماً أو ضغط إلغاء، يعمل السكربت كالمعتاد
+            code_to_run = code
+
         namespace = {}
         try:
             # حماية .plot() التفاعلية (تحتاج openmc.lib، غالباً غير متوفرة/معطوبة
@@ -176,7 +211,8 @@ class ScriptEditorWidget(QWidget):
             except ImportError:
                 pass
 
-            exec(code, namespace)
+            # تنفيذ الكود المحسن (code_to_run) بدلاً من القديم
+            exec(code_to_run, namespace)
             self.script_executed.emit(namespace)
         except Exception as e:
             QMessageBox.warning(self, "Script Error", str(e))
