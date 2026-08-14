@@ -1,5 +1,5 @@
 import openmc
-import re  # تمت الإضافة لتعقيم أسماء المتغيرات
+import re  # Added to sanitize variable names
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QGroupBox, QListWidget, QAbstractItemView, QMessageBox, QFormLayout, QStackedWidget
@@ -17,14 +17,13 @@ class TalliesPageWidget(QWidget):
     """
     script_generated = Signal(str)
 
-    # كل أنواع الفلاتر المدعومة، مبنية ديناميكياً (نفس نمط SURFACE_TYPES في
-    # صفحة الهندسة): kind يحدد شكل حقول الإدخال المطلوبة.
-    #   varlist   -> قائمة أسماء متغيرات مفصولة بفواصل (خلايا/مواد/أكوان/أسطح)
-    #   singlevar -> متغير واحد فقط
-    #   floatlist -> قائمة أرقام عشرية مفصولة بفواصل (تُدرج كما هي في الكود)
-    #   intlist   -> قائمة أعداد صحيحة مفصولة بفواصل
-    #   strlist   -> قائمة نصوص (توضع بين علامتي اقتباس تلقائياً)
-    #   mesh      -> بُعد/زاوية سفلية/زاوية علوية لبناء RegularMesh
+    # All supported filter types, built dynamically. 'kind' dictates required inputs.
+    #   varlist   -> comma-separated variable names (cells/materials/universes/surfaces)
+    #   singlevar -> single variable
+    #   floatlist -> comma-separated floats (inserted as is)
+    #   intlist   -> comma-separated integers
+    #   strlist   -> comma-separated strings (auto-quoted)
+    #   mesh      -> dimension/lower left/upper right for RegularMesh
     FILTER_TYPES = {
         "CellFilter": {"kind": "varlist", "ctor": "CellFilter",
                        "label": "Cells (comma-separated variables):", "default": "c1"},
@@ -81,7 +80,7 @@ class TalliesPageWidget(QWidget):
         main_layout = QVBoxLayout(self)
 
         # ==========================================
-        # --- قسم تعريف العداد (Tally Definition) ---
+        # --- Tally Definition Section ---
         # ==========================================
         tally_group = QGroupBox("Define Tally")
         tally_layout = QFormLayout(tally_group)
@@ -91,10 +90,8 @@ class TalliesPageWidget(QWidget):
 
         self.scores_list = QListWidget()
         self.scores_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        # "capture" ليست درجة صحيحة في OpenMC؛ المكافئ الصحيح للأسر الإشعاعي
-        # هو تفاعل (n,gamma). أضفنا أيضاً بعض تفاعلات MT الشائعة و"heating"
-        # التي تعتمد عليها صفحة Results. أي درجة أخرى (بما فيها أرقام MT
-        # الخام) يمكن إضافتها عبر حقل "Custom Score" أدناه.
+        # Added common MT reactions and "heating" required by Results page.
+        # Any other score (including raw MT numbers) can be added via "Custom Score".
         scores = ["flux", "absorption", "fission", "total", "scatter", "nu-fission",
                   "heating", "heating-local", "kappa-fission",
                   "(n,gamma)", "(n,p)", "(n,a)", "(n,2n)", "(n,3n)",
@@ -121,7 +118,7 @@ class TalliesPageWidget(QWidget):
         main_layout.addWidget(tally_group)
 
         # ==========================================
-        # --- قسم الفلاتر (يدعم فلاتر متعددة لكل عداد) ---
+        # --- Filters Section (Supports Multiple Filters per Tally) ---
         # ==========================================
         filter_group = QGroupBox("Filters (a tally may combine multiple filters, e.g. Cell + Energy)")
         filter_layout = QFormLayout(filter_group)
@@ -159,7 +156,7 @@ class TalliesPageWidget(QWidget):
                 self.filter_param_widgets[type_name] = {"value": edit}
             self.filter_param_stack.addWidget(page)
 
-        # آخر صفحة: نموذج محاكاة الكاشف (Pulse Height preset)
+        # Last page: Detector Simulation Model (Pulse Height preset)
         self.detector_widget = QWidget()
         d_layout = QFormLayout(self.detector_widget)
         d_layout.setContentsMargins(0, 0, 0, 0)
@@ -198,7 +195,7 @@ class TalliesPageWidget(QWidget):
         main_layout.addWidget(filter_group)
 
         # ==========================================
-        # --- الأزرار والقائمة السفلية ---
+        # --- Bottom Buttons and Lists ---
         # ==========================================
         btn_add = QPushButton("Add Tally & Generate Script")
         btn_add.setStyleSheet("background-color: #0e639c; color: white; font-weight: bold; padding: 10px;")
@@ -391,8 +388,8 @@ class TalliesPageWidget(QWidget):
             QMessageBox.warning(self, "Warning", "Please provide a valid Tally Name.")
             return
 
-        # --- التعقيم الذكي (Sanitization) ---
-        # تحويل أي حرف غير صالح لبايثون إلى شرطة سفلية، وضمان عدم البدء برقم
+        # --- Smart Sanitization ---
+        # Convert invalid Python characters to underscores, prevent starting with digits
         t_var_name = re.sub(r'\W', '_', raw_name)
         if re.match(r'^\d', t_var_name):
             t_var_name = f"t_{t_var_name}"
@@ -417,13 +414,13 @@ class TalliesPageWidget(QWidget):
                     "(use the 'Pulse Height (Detector F8)' filter type, which adds both at once).")
                 return
 
-        # --- توليد كود البايثون (Script Generation) ---
+        # --- Script Generation ---
         py_code = f"\n# --- Tally Definition: {raw_name} ---\n"
         for f in self.pending_filters:
             if f["code"]:
                 py_code += f["code"]
 
-        # نستخدم t_var_name المتغير المعقم في الكود، و raw_name كاسم للعرض في OpenMC
+        # Use the sanitized t_var_name in code, and raw_name for display in OpenMC
         py_code += f"{t_var_name} = openmc.Tally(name='{raw_name}')\n"
         scores_str = ", ".join([f"'{s}'" for s in selected_scores])
         py_code += f"{t_var_name}.scores = [{scores_str}]\n"

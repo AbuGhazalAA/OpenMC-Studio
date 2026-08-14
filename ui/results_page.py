@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
-    QApplication, QDialog
+    QApplication, QDialog, QListWidget, QAbstractItemView
 )
 from PySide6.QtCore import Qt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -87,6 +87,48 @@ def _heavy_metal_mass_kg(atoms_row, nuc_index):
         if element in _HEAVY_METAL_Z and mass_number and idx < len(atoms_row):
             grams += float(atoms_row[idx]) * mass_number / _AVOGADRO
     return grams / 1000.0
+
+
+def _reactivity_pcm(k_val, k_err):
+    """Reactivity in pcm, the unit reactor physicists actually quote:
+
+        rho = (k - 1) / k   x 1e5
+
+    The uncertainty follows from d(rho)/dk = 1/k^2, so sigma_rho =
+    sigma_k / k^2 x 1e5. Steps where k is non-positive (never physical,
+    but possible in a corrupt file) are returned as NaN rather than
+    raising, so one bad step cannot destroy the whole curve.
+    """
+    k = np.asarray(k_val, dtype=float)
+    e = np.asarray(k_err, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rho = np.where(k > 0, (k - 1.0) / k * 1.0e5, np.nan)
+        rho_err = np.where(k > 0, e / (k ** 2) * 1.0e5, np.nan)
+    return rho, rho_err
+
+
+def _cycle_end(x_vals, k_val):
+    """Where the reactor goes subcritical: the x-value at which k first
+    crosses 1.0, found by linear interpolation between the two bracketing
+    depletion steps.
+
+    Returns (x_at_k1, index_after) or (None, None) when k never crosses --
+    either it stays above 1 for the whole run (cycle not finished) or it
+    started below 1 (already subcritical at t=0).
+    """
+    k = np.asarray(k_val, dtype=float)
+    x = np.asarray(x_vals, dtype=float)
+    n = min(len(k), len(x))
+    if n < 2 or k[0] < 1.0:
+        return None, None
+    for i in range(1, n):
+        if k[i - 1] >= 1.0 > k[i]:
+            dk = k[i - 1] - k[i]
+            if dk == 0:
+                return float(x[i]), i
+            frac = (k[i - 1] - 1.0) / dk
+            return float(x[i - 1] + frac * (x[i] - x[i - 1])), i
+    return None, None
 
 
 def _identify_nuclide(energy_keV, fwhm_keV, tolerance_factor=3.0, min_tolerance_keV=1.0):
@@ -229,9 +271,17 @@ class ResultsPageWidget(QWidget):
         self.tally_plot_dialog.combo_dep_x.currentIndexChanged.connect(self._plot_depletion_data)
         dep_layout.addWidget(self.tally_plot_dialog.combo_dep_x)
 
-        dep_layout.addWidget(QLabel("<b>Y-Axis:</b>"))
+        # Quantity: what physically goes on the Y axis. Reactivity gets its own
+        # entry because reactor physicists work in pcm, not in raw k.
+        dep_layout.addWidget(QLabel("<b>Quantity:</b>"))
         self.tally_plot_dialog.combo_dep_y = QComboBox()
-        self.tally_plot_dialog.combo_dep_y.currentIndexChanged.connect(self._plot_depletion_data)
+        self.tally_plot_dialog.combo_dep_y.addItems(
+            ["k-effective", "Reactivity (pcm)", "Nuclide inventory"])
+        self.tally_plot_dialog.combo_dep_y.setToolTip(
+            "k-effective      -- the multiplication factor as computed\n"
+            "Reactivity (pcm) -- rho = (k-1)/k x 1e5, plus the cycle end where k crosses 1\n"
+            "Nuclide inventory-- how the selected nuclides evolve with burnup")
+        self.tally_plot_dialog.combo_dep_y.currentIndexChanged.connect(self._on_dep_quantity_changed)
         dep_layout.addWidget(self.tally_plot_dialog.combo_dep_y)
 
         # Material selector: summing every depletable material together hides
@@ -240,6 +290,7 @@ class ResultsPageWidget(QWidget):
         # only the default.
         dep_layout.addWidget(QLabel("<b>Material:</b>"))
         self.tally_plot_dialog.combo_dep_mat = QComboBox()
+        self.tally_plot_dialog.combo_dep_mat.setMinimumWidth(150)
         self.tally_plot_dialog.combo_dep_mat.setToolTip(
             "Which depletable material to trace.\n"
             "'All materials (sum)' adds every region together, which can hide\n"
@@ -268,6 +319,63 @@ class ResultsPageWidget(QWidget):
 
         plot_controls.addStretch()
         layout.addLayout(plot_controls)
+
+        # Second row, for the inventory view only. Nuclide list + units + scale
+        # were originally squeezed into the single row above, which left the
+        # Material dropdown truncated and the list overlapping its neighbours.
+        self.tally_plot_dialog.nuclide_box = QWidget()
+        nuc_box_layout = QHBoxLayout(self.tally_plot_dialog.nuclide_box)
+        nuc_box_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Multi-select nuclide list: comparing U235 against Pu239 against Pu241
+        # on one set of axes is the single most common thing asked of a burnup
+        # plot, which a one-at-a-time dropdown cannot do.
+        nuc_box_layout.addWidget(QLabel("<b>Nuclides:</b>"))
+        self.tally_plot_dialog.list_dep_nuclides = QListWidget()
+        self.tally_plot_dialog.list_dep_nuclides.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tally_plot_dialog.list_dep_nuclides.setFixedHeight(96)
+        self.tally_plot_dialog.list_dep_nuclides.setMinimumWidth(200)
+        self.tally_plot_dialog.list_dep_nuclides.setToolTip(
+            "Hold Ctrl to pick several nuclides and overlay them on one plot.")
+        self.tally_plot_dialog.list_dep_nuclides.itemSelectionChanged.connect(
+            self._plot_depletion_data)
+        nuc_box_layout.addWidget(self.tally_plot_dialog.list_dep_nuclides)
+
+        nuc_box_layout.addSpacing(12)
+        nuc_box_layout.addWidget(QLabel("<b>Units:</b>"))
+        self.tally_plot_dialog.combo_dep_units = QComboBox()
+        self.tally_plot_dialog.combo_dep_units.setMinimumWidth(190)
+        self.tally_plot_dialog.combo_dep_units.addItems([
+            "Atoms", "Mass (g)", "Weight %", "Atom density (a/b-cm)", "Normalized N/N0"])
+        self.tally_plot_dialog.combo_dep_units.setToolTip(
+            "Atoms                 -- raw inventory as stored in the file\n"
+            "Mass (g)              -- atoms x A / N_A\n"
+            "Weight %              -- share of that material's total mass\n"
+            "Atom density (a/b-cm) -- the unit OpenMC inputs use (needs the material volume)\n"
+            "Normalized N/N0       -- relative to the first step, the clearest view of burn rate")
+        self.tally_plot_dialog.combo_dep_units.currentIndexChanged.connect(self._plot_depletion_data)
+        nuc_box_layout.addWidget(self.tally_plot_dialog.combo_dep_units)
+
+        nuc_box_layout.addSpacing(12)
+        nuc_box_layout.addWidget(QLabel("<b>Y Scale:</b>"))
+        self.tally_plot_dialog.combo_dep_scale = QComboBox()
+        self.tally_plot_dialog.combo_dep_scale.setMinimumWidth(110)
+        self.tally_plot_dialog.combo_dep_scale.addItems(["Auto", "Linear", "Log"])
+        self.tally_plot_dialog.combo_dep_scale.setToolTip(
+            "Auto   -- logarithmic when the values span more than two decades\n"
+            "          and none of them is zero, otherwise linear\n"
+            "Linear -- always linear\n"
+            "Log    -- always logarithmic. A logarithm of zero is undefined, so a\n"
+            "          nuclide that is bred from nothing (Pu239, fission products)\n"
+            "          starts at exactly 0 and cannot be shown on a log axis.")
+        self.tally_plot_dialog.combo_dep_scale.currentIndexChanged.connect(
+            self._on_dep_scale_changed)
+        nuc_box_layout.addWidget(self.tally_plot_dialog.combo_dep_scale)
+
+        nuc_box_layout.addStretch()
+        layout.addWidget(self.tally_plot_dialog.nuclide_box)
+        self.tally_plot_dialog.nuclide_box.setVisible(False)
 
         self.tally_plot_dialog.status_label = QLabel("Select a Tally from the main window to display its result.")
         self.tally_plot_dialog.status_label.setStyleSheet("color: #666666; font-style: italic; font-weight: normal;")
@@ -485,6 +593,7 @@ class ResultsPageWidget(QWidget):
                 #     atoms[:, idx] returns a 3-D slab instead of a single curve.
                 nuc_index = {}
                 mat_index = {}
+                mat_volume = {}
                 atoms_by_mat = None
 
                 try:
@@ -500,6 +609,12 @@ class ResultsPageWidget(QWidget):
                             _idx = _node.attrs.get('index')
                             if _idx is not None:
                                 mat_index[str(_name)] = int(_idx)
+                            # Volume is stored alongside the index and is what
+                            # makes atom DENSITY (atom/b-cm) -- the unit OpenMC
+                            # inputs actually use -- computable at all.
+                            _vol = _node.attrs.get('volume')
+                            if _vol is not None:
+                                mat_volume[str(_name)] = float(_vol)
 
                     if 'number' in f and isinstance(f['number'], h5py.Dataset):
                         _num = np.array(f['number'], dtype=float)
@@ -559,6 +674,7 @@ class ResultsPageWidget(QWidget):
                     'nuc_index': nuc_index,
                     'mat_index': mat_index,
                     'atoms_by_mat': atoms_by_mat,
+                    'mat_volume': mat_volume,
                     'hm_mass_kg': hm_mass_kg,
                     'hm_mass_by_mat': hm_mass_by_mat
                 }
@@ -600,30 +716,19 @@ class ResultsPageWidget(QWidget):
                 self.tally_plot_dialog.combo_plot_type.setVisible(False)
                 self.tally_plot_dialog.depletion_controls.setVisible(True)
 
-                # Setup smart isotope list (Y-Axis)
-                self.tally_plot_dialog.combo_dep_y.blockSignals(True)
-                self.tally_plot_dialog.combo_dep_y.clear()
-                self.tally_plot_dialog.combo_dep_y.addItem("k-effective", "k-effective")
-
-                popular_isotopes = ['U235', 'Pu239', 'Xe135', 'Sm149', 'U238', 'O16']
-                added = set()
-                if nuclides:
-                    # Priority isotopes at the top
-                    for p in popular_isotopes:
-                        if p in nuclides:
-                            self.tally_plot_dialog.combo_dep_y.addItem(f"Atoms: {p}", p)
-                            added.add(p)
-
-                    if added:
-                        self.tally_plot_dialog.combo_dep_y.insertSeparator(
-                            self.tally_plot_dialog.combo_dep_y.count())
-
-                    # Remaining isotopes
-                    for nuc in nuclides:
-                        if nuc not in added:
-                            self.tally_plot_dialog.combo_dep_y.addItem(f"Atoms: {nuc}", nuc)
-
-                self.tally_plot_dialog.combo_dep_y.blockSignals(False)
+                # Fill the nuclide list, most-studied ones first so the common
+                # case needs no scrolling.
+                popular_isotopes = ['U235', 'U238', 'Pu239', 'Pu240', 'Pu241',
+                                    'Xe135', 'Sm149', 'Cs137', 'Sr90']
+                lw = self.tally_plot_dialog.list_dep_nuclides
+                lw.blockSignals(True)
+                lw.clear()
+                ordered = [n for n in popular_isotopes if n in nuc_index]
+                ordered += [n for n in nuclides if n not in ordered]
+                lw.addItems(ordered)
+                if lw.count():
+                    lw.item(0).setSelected(True)
+                lw.blockSignals(False)
 
                 # Populate the material selector ("All" first, then each one)
                 self.tally_plot_dialog.combo_dep_mat.blockSignals(True)
@@ -649,6 +754,145 @@ class ResultsPageWidget(QWidget):
             QMessageBox.critical(self, "Depletion Read Error", f"Could not read depletion file:\n{str(e)}")
             self._log(f"⚠️ Depletion analysis error: {e}")
 
+    def _on_dep_quantity_changed(self):
+        """Nuclide picker and units only make sense for the inventory view."""
+        is_inventory = self.tally_plot_dialog.combo_dep_y.currentText() == "Nuclide inventory"
+        self.tally_plot_dialog.nuclide_box.setVisible(is_inventory)
+        self._plot_depletion_data()
+
+    def _on_dep_scale_changed(self):
+        """Re-arms the one-shot explanation so that deliberately choosing
+        'Log' again tells the user why it was refused, instead of silently
+        falling back to a linear axis a second time."""
+        self._log_scale_notice_shown = False
+        self._plot_depletion_data()
+
+    def _apply_y_scale(self, ax, curves):
+        """Applies the requested Y scale and returns a note for the status bar.
+
+        `curves` is the list of arrays actually drawn. A logarithmic axis is
+        undefined at zero, and in a burnup calculation a bred nuclide (Pu239,
+        every fission product) legitimately starts at exactly zero -- so the
+        request has to be refused rather than silently producing an empty or
+        clipped plot. When the user asked for Log explicitly, say so once in a
+        dialog; 'Auto' just decides quietly.
+        """
+        mode = self.tally_plot_dialog.combo_dep_scale.currentText()
+        if not curves:
+            return ""
+
+        all_values = np.concatenate([np.asarray(c, dtype=float).ravel() for c in curves])
+        finite = all_values[np.isfinite(all_values)]
+        if finite.size == 0:
+            return ""
+
+        has_non_positive = bool(np.any(finite <= 0))
+        positive = finite[finite > 0]
+        span = (finite.max() / positive.min()) if positive.size else 0.0
+
+        if mode == "Linear":
+            ax.set_yscale('linear')
+            return ""
+
+        if mode == "Log":
+            if has_non_positive:
+                ax.set_yscale('linear')
+                message = (
+                    "A logarithmic Y axis cannot be used for this selection.\n\n"
+                    "At least one of the plotted curves contains a zero (or negative) "
+                    "value, and log(0) is undefined.\n\n"
+                    "This is normal and not an error: a nuclide that is bred during "
+                    "irradiation — Pu239, Am241, or any fission product — starts at "
+                    "exactly zero atoms before the first depletion step.\n\n"
+                    "The plot has been drawn on a linear axis instead. To use a "
+                    "logarithmic axis, either deselect the nuclides that start at "
+                    "zero, or switch Units to 'Weight %' or 'Normalized N/N0'."
+                )
+                if not getattr(self, '_log_scale_notice_shown', False):
+                    self._log_scale_notice_shown = True
+                    QMessageBox.information(
+                        self.tally_plot_dialog, "Logarithmic Scale Not Applicable", message)
+                self._log("ℹ️ Log Y axis refused: a plotted curve contains zero "
+                          "(a bred nuclide starts at 0 atoms). Using a linear axis.")
+                return "log refused (a curve starts at zero) — linear used"
+            ax.set_yscale('log')
+            return "log scale"
+
+        # Auto
+        if not has_non_positive and span > 100:
+            ax.set_yscale('log')
+            return "auto: log"
+        ax.set_yscale('linear')
+        return "auto: linear"
+
+    def _dep_series(self, nuc_name, unit, mat_sel):
+        """One nuclide's curve in the requested unit, or (None, reason).
+
+        Units other than raw atoms need extra context that is all already in
+        the file: the mass number (from the nuclide's own name), the material
+        volume (for atom density), or the material's total mass (for weight %).
+        """
+        d = self._depletion_data
+        atoms_by_mat = d.get('atoms_by_mat')
+        nuc_index = d.get('nuc_index', {})
+        mat_index = d.get('mat_index', {})
+        mat_volume = d.get('mat_volume', {})
+
+        if atoms_by_mat is None or atoms_by_mat.ndim != 3 or nuc_name not in nuc_index:
+            return None, "no inventory data"
+        ni = nuc_index[nuc_name]
+        if ni >= atoms_by_mat.shape[2]:
+            return None, "index out of range"
+
+        if mat_sel is None:
+            atoms = atoms_by_mat[:, :, ni].sum(axis=1)
+            volume = sum(mat_volume.get(m, 0.0) for m in mat_index)
+            block = atoms_by_mat.sum(axis=1)                  # (steps, nuclides)
+        else:
+            if mat_sel not in mat_index:
+                return None, "material not found"
+            mi = mat_index[mat_sel]
+            atoms = atoms_by_mat[:, mi, ni]
+            volume = mat_volume.get(mat_sel, 0.0)
+            block = atoms_by_mat[:, mi, :]                    # (steps, nuclides)
+
+        atoms = np.asarray(atoms, dtype=float)
+
+        if unit == "Atoms":
+            return atoms, None
+
+        _el, mass_number = _split_nuclide_name(nuc_name)
+        if unit == "Mass (g)":
+            if not mass_number:
+                return None, "mass number unknown"
+            return atoms * mass_number / _AVOGADRO, None
+
+        if unit == "Weight %":
+            if not mass_number:
+                return None, "mass number unknown"
+            # Total mass of the material at each step, from every nuclide in it.
+            total = np.zeros(block.shape[0], dtype=float)
+            for name, idx in nuc_index.items():
+                _e, a = _split_nuclide_name(name)
+                if a and idx < block.shape[1]:
+                    total += block[:, idx] * a
+            with np.errstate(divide='ignore', invalid='ignore'):
+                pct = np.where(total > 0, atoms * mass_number / total * 100.0, np.nan)
+            return pct, None
+
+        if unit == "Atom density (a/b-cm)":
+            if volume <= 0:
+                return None, "material volume not stored in this file"
+            # atoms/cm^3 x 1e-24 cm^2/barn
+            return atoms / volume * 1.0e-24, None
+
+        if unit == "Normalized N/N0":
+            if atoms.size == 0 or atoms[0] == 0:
+                return None, "starts at zero (cannot normalise)"
+            return atoms / atoms[0], None
+
+        return atoms, None
+
     def _plot_depletion_data(self):
         """Plot depletion, burnup, and isotope data"""
         if not hasattr(self, '_depletion_data') or not self._depletion_data:
@@ -663,8 +907,8 @@ class ResultsPageWidget(QWidget):
         atoms_by_mat = self._depletion_data.get('atoms_by_mat', None)
 
         x_mode = self.tally_plot_dialog.combo_dep_x.currentText()
-        y_mode = self.tally_plot_dialog.combo_dep_y.currentData()
         y_text = self.tally_plot_dialog.combo_dep_y.currentText()
+        y_mode = y_text
 
         # Setup X-Axis
         if "Burnup" in x_mode:
@@ -688,51 +932,87 @@ class ResultsPageWidget(QWidget):
         self._clear_tally_plot()
         ax = self.tally_plot_dialog.ax
 
+        status = ""
+
         # Setup Y-Axis
         if y_mode == "k-effective":
             ax.errorbar(x_data, k_val, yerr=k_err, marker='o', linestyle='-',
                         color='#d35400', ecolor='red', capsize=5, markersize=6, linewidth=2, label='k-effective')
+            ax.axhline(1.0, color='green', linestyle='--', linewidth=1.2, alpha=0.8, label='critical (k = 1)')
             ax.set_ylabel('k-effective', fontsize=10, fontweight='bold')
             ax.set_title('Reactor k-effective vs. Depletion', fontsize=12, fontweight='bold')
-        else:
-            nuc_name = y_mode
+            x_end, _ = _cycle_end(x_data, k_val)
+            if x_end is not None:
+                ax.axvline(x_end, color='purple', linestyle=':', linewidth=1.5,
+                           label=f'cycle end @ {x_end:.4g}')
+                status = f"Cycle end (k = 1) at {x_end:.4g} — "
+            status += f"k: {k_val[0]:.5f} → {k_val[-1]:.5f}"
+
+        elif y_mode == "Reactivity (pcm)":
+            rho, rho_err = _reactivity_pcm(k_val, k_err)
+            ax.errorbar(x_data, rho, yerr=rho_err, marker='o', linestyle='-',
+                        color='#c0392b', ecolor='#e59866', capsize=5, markersize=6,
+                        linewidth=2, label='reactivity')
+            ax.axhline(0.0, color='green', linestyle='--', linewidth=1.2, alpha=0.8,
+                       label='critical (rho = 0)')
+            ax.set_ylabel('Reactivity  ρ = (k−1)/k  [pcm]', fontsize=10, fontweight='bold')
+            ax.set_title('Reactivity vs. Depletion', fontsize=12, fontweight='bold')
+            x_end, _ = _cycle_end(x_data, k_val)
+            if x_end is not None:
+                ax.axvline(x_end, color='purple', linestyle=':', linewidth=1.5,
+                           label=f'cycle end @ {x_end:.4g}')
+            finite = rho[np.isfinite(rho)]
+            if finite.size:
+                swing = finite[0] - finite[-1]
+                status = (f"ρ: {finite[0]:.0f} → {finite[-1]:.0f} pcm "
+                          f"(swing {swing:.0f} pcm)")
+                if x_end is not None:
+                    status += f" — cycle end at {x_end:.4g}"
+
+        else:  # Nuclide inventory
+            unit = self.tally_plot_dialog.combo_dep_units.currentText()
             mat_sel = self.tally_plot_dialog.combo_dep_mat.currentData()
+            scope = "all materials" if mat_sel is None else f"material {mat_sel}"
+            selected = [i.text() for i in
+                        self.tally_plot_dialog.list_dep_nuclides.selectedItems()]
 
-            y_data = None
-            scope = None
-            if atoms_by_mat is not None and nuc_name in nuc_index:
-                ni = nuc_index[nuc_name]
-                if atoms_by_mat.ndim == 3 and atoms_by_mat.shape[2] > ni:
-                    if mat_sel is None:
-                        y_data = atoms_by_mat[:, :, ni].sum(axis=1)
-                        scope = "all materials"
-                    elif mat_sel in mat_index:
-                        y_data = atoms_by_mat[:, mat_index[mat_sel], ni]
-                        scope = f"material {mat_sel}"
+            plotted, skipped, curves = [], [], []
+            for nuc_name in selected:
+                y_data, reason = self._dep_series(nuc_name, unit, mat_sel)
+                if y_data is None:
+                    skipped.append(f"{nuc_name} ({reason})")
+                    continue
+                ax.plot(x_data[:len(y_data)], y_data, marker='s', linestyle='-',
+                        markersize=5, linewidth=1.8, label=nuc_name)
+                plotted.append(nuc_name)
+                curves.append(y_data)
 
-            if y_data is not None:
-                ax.plot(x_data, y_data, marker='s', linestyle='-', color='#0e639c',
-                        markersize=6, linewidth=2, label=f'{nuc_name} ({scope})')
-                ax.set_ylabel(f'Atoms of {nuc_name}', fontsize=10, fontweight='bold')
-                ax.set_title(f'Evolution of {nuc_name} vs. Depletion — {scope}',
+            if plotted:
+                ax.set_ylabel(f'{unit} — {scope}', fontsize=10, fontweight='bold')
+                title_nucs = ", ".join(plotted[:4]) + ("…" if len(plotted) > 4 else "")
+                ax.set_title(f'Inventory: {title_nucs} — {scope}',
                              fontsize=12, fontweight='bold')
-                # Log scale only when it genuinely helps AND nothing would break
-                # it: a bred nuclide such as Pu239 legitimately starts at 0.
-                positive = y_data[y_data > 0]
-                if positive.size and y_data.max() / positive.min() > 100 and y_data.min() > 0:
-                    ax.set_yscale('log')
+                scale_note = self._apply_y_scale(ax, curves)
+                status = f"{len(plotted)} nuclide(s) in {unit}, {scope}"
+                if scale_note:
+                    status += f" | {scale_note}"
+                if skipped:
+                    status += f" | skipped: {', '.join(skipped)}"
             else:
-                ax.text(0.5, 0.5, f"No inventory data available for {nuc_name}",
-                        ha='center', va='center', transform=ax.transAxes)
+                msg = "Select one or more nuclides from the list."
+                if skipped:
+                    msg = "Could not plot: " + ", ".join(skipped)
+                ax.text(0.5, 0.5, msg, ha='center', va='center', transform=ax.transAxes)
+                status = msg
 
         ax.set_xlabel(x_label, fontsize=10, fontweight='bold')
         ax.grid(True, linestyle='--', alpha=0.7)
         if ax.lines or ax.containers:
-            ax.legend(loc='best')
+            ax.legend(loc='best', fontsize=8)
 
         self.tally_plot_dialog.figure.tight_layout()
         self.tally_plot_dialog.canvas.draw_idle()
-        self.tally_plot_dialog.status_label.setText(f"✅ Plotted {y_text} against {x_label}.")
+        self.tally_plot_dialog.status_label.setText(f"✅ {y_text} vs {x_label}  |  {status}")
 
     def process_statepoint(self, filepath):
         try:

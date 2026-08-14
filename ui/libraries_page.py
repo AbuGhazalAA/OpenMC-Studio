@@ -14,6 +14,8 @@ class LibrariesPageWidget(QWidget):
     تسمح بتحديد مسار ملف cross_sections.xml وتصفح النظائر المتاحة.
     """
     library_changed = Signal(str)
+    # إضافة الإشارة الجديدة لإرسال الكود إلى الشاشة البرتقالية
+    script_generated = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,11 +79,27 @@ class LibrariesPageWidget(QWidget):
             QMessageBox.warning(self, "Invalid Path", "Please select a valid cross_sections.xml file path.")
             return
 
-        # تعيين متغير البيئة ليقرأه محرك OpenMC فوراً
+        # 1. تعيين متغير البيئة ليقرأه محرك OpenMC في الويندوز (في حال أردنا التشغيل محلياً لاحقاً)
         os.environ["OPENMC_CROSS_SECTIONS"] = path
-        QMessageBox.information(self, "Success",
-                                f"Environment variable OPENMC_CROSS_SECTIONS set successfully to:\n{path}")
+
+        # 2. التحويل الذكي لمسار لينكس (WSL)
+        wsl_path = path.replace('\\', '/')
+        if len(wsl_path) > 2 and wsl_path[1] == ':':
+            drive = wsl_path[0].lower()
+            wsl_path = f"/mnt/{drive}" + wsl_path[2:]
+
+        # 3. توليد الكود للشاشة البرتقالية
+        code = f"\n# --- Cross Sections Library Setup (WSL Compatible) ---\n"
+        code += f"openmc.config['cross_sections'] = '{wsl_path}'\n"
+
+        # إرسال الكود والإشارات
+        self.script_generated.emit(code)
         self.library_changed.emit(path)
+
+        QMessageBox.information(
+            self, "Success",
+            f"Environment set for Windows.\n\nScript automatically updated for WSL with path:\n{wsl_path}"
+        )
 
     def scan_isotopes(self):
         path = self.path_field.text().strip()

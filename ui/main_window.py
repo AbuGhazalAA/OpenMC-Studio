@@ -10,7 +10,10 @@ import json
 import numpy as np
 import multiprocessing
 from datetime import datetime
+
+# Import the new combined Depletion and Burnup interface
 from ui.depletion_page import DepletionPageWidget
+from ui.burnup_page import DepletionBurnupWidget
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QDockWidget,
@@ -33,7 +36,7 @@ from core.project_manager import ProjectManager
 from ui.script_editor import ScriptEditorWidget
 from ui.libraries_page import LibrariesPageWidget
 
-# تحميل الصفحة الثنائية الأبعاد فقط في البداية لتسريع التشغيل
+# Load the 2D page only at startup to speed up launch
 from ui.plots.plots_page import PlotsPageWidget
 
 import openmc
@@ -49,7 +52,7 @@ class OpenMCSyntaxHighlighter(QSyntaxHighlighter):
         super().__init__(document)
         self.highlighting_rules = []
 
-        # كلمات لغة بايثون (برتقالي)
+        # Python keywords (orange)
         keyword_format = QTextCharFormat()
         keyword_format.setForeground(QColor("#FF7700"))
         keyword_format.setFontWeight(QFont.Bold)
@@ -62,7 +65,7 @@ class OpenMCSyntaxHighlighter(QSyntaxHighlighter):
             pattern = QRegularExpression(rf"\b{word}\b")
             self.highlighting_rules.append((pattern, keyword_format))
 
-        # كلمات OpenMC (أزرق فاتح / سماوي)
+        # OpenMC keywords (light blue / cyan)
         openmc_format = QTextCharFormat()
         openmc_format.setForeground(QColor("#00A0FF"))
         openmc_format.setFontWeight(QFont.Bold)
@@ -76,20 +79,20 @@ class OpenMCSyntaxHighlighter(QSyntaxHighlighter):
             pattern = QRegularExpression(rf"\b{word}\b")
             self.highlighting_rules.append((pattern, openmc_format))
 
-        # الأرقام (وردي)
+        # Numbers (pink)
         number_format = QTextCharFormat()
         number_format.setForeground(QColor("#FF00FF"))
         self.highlighting_rules.append((QRegularExpression(r"\b[0-9]+[lL]?\b"), number_format))
         self.highlighting_rules.append(
             (QRegularExpression(r"\b[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\b"), number_format))
 
-        # النصوص Strings (أخضر فاتح)
+        # Strings (light green)
         string_format = QTextCharFormat()
         string_format.setForeground(QColor("#00AA00"))
         self.highlighting_rules.append((QRegularExpression("\".*?\""), string_format))
         self.highlighting_rules.append((QRegularExpression("'.*?'"), string_format))
 
-        # التعليقات Comments (رمادي مائل)
+        # Comments (italic gray)
         comment_format = QTextCharFormat()
         comment_format.setForeground(QColor("#888888"))
         comment_format.setFontItalic(True)
@@ -230,6 +233,8 @@ class ExportWorker(QThread):
                 "        _omcs_mats_list.append(_omcs_val)\n"
                 "    elif isinstance(_omcs_val, openmc.Settings):\n"
                 "        _omcs_settings_obj = _omcs_val\n"
+                "    elif isinstance(_omcs_val, openmc.Settings):\n"
+                "        _omcs_settings_obj = _omcs_val\n"
                 "    elif isinstance(_omcs_val, openmc.Tallies):\n"
                 "        _omcs_tallies_obj = _omcs_val\n"
                 "    elif isinstance(_omcs_val, openmc.Plots):\n"
@@ -338,7 +343,6 @@ class SimulationWorker(QThread):
             if self.is_depletion:
                 wsl_path = self.export_dir.replace('\\', '/').replace('C:', '/mnt/c').replace('D:', '/mnt/d')
 
-                # استخدام تشغيل قياسي مباشر لبايثون في بيئة لينكس التفاعلية
                 cmd = ["wsl", "bash", "-lic", f"cd '{wsl_path}' && conda run -n openmc_env python current_script.py"]
             else:
                 cmd = ["openmc"]
@@ -526,7 +530,7 @@ class MainWindow(QMainWindow):
         self._setup_statusbar()
         self._apply_theme()
 
-        # ضمان كتابة أمر التصفير في الصفحة الافتراضية
+        # Ensure the reset command is written in the default page
         now_str = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
         initial_text = f"# c      Created on: {now_str}\n\nimport openmc\nopenmc.reset_auto_ids()\n\n"
         if hasattr(self.script_editor, 'editor'):
@@ -600,7 +604,7 @@ class MainWindow(QMainWindow):
             QToolButton {{ color: #000000; font-weight: bold; }}
             QStatusBar {{ background-color: {primary}; color: white; font-weight: bold; }}
 
-            /* إخفاء التبويبات بالكامل */
+            /* Hide tabs completely */
             QTabWidget::pane {{ border: 2px solid {primary}; border-top-left-radius: 5px; border-top-right-radius: 5px; }}
 
             QGroupBox {{ border: 2px solid {primary}; border-radius: 5px; margin-top: 1ex; font-weight: bold; color: {primary}; }}
@@ -615,6 +619,33 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, 'script_editor'):
             self.script_editor.set_theme(self.current_theme)
+
+    # --- New function to intelligently insert cross-section config at the top ---
+    def insert_library_code_at_top(self, code):
+        text = self._get_script_text()
+
+        # Clean up any existing cross_sections config to avoid duplicates
+        text = re.sub(r"\n# --- Cross Sections Library Setup.*?openmc\.config\['cross_sections'\].*?\n", "", text,
+                      flags=re.DOTALL)
+        text = re.sub(r"openmc\.config\['cross_sections'\].*\n", "", text)
+
+        # Insert intelligently after openmc.reset_auto_ids() or import openmc
+        target = "openmc.reset_auto_ids()"
+        if target in text:
+            new_text = text.replace(target, f"{target}\n{code}")
+        elif "import openmc" in text:
+            new_text = text.replace("import openmc", f"import openmc\n{code}")
+        else:
+            new_text = f"import openmc\n{code}\n{text}"
+
+        # Update the editor
+        if hasattr(self.script_editor, 'editor'):
+            self.script_editor.editor.setPlainText(new_text)
+        else:
+            self.script_editor.setPlainText(new_text)
+
+        if hasattr(self, 'console_widget'):
+            self.console_widget.append_log("✅ Cross-sections path automatically inserted at the TOP of the script.")
 
     def _setup_tool_windows(self):
         for attr_name in ('win_materials', 'win_geometry', 'win_settings', 'win_tallies', 'win_libraries'):
@@ -635,6 +666,9 @@ class MainWindow(QMainWindow):
             lambda code: self.script_editor.replace_tagged_block("GEOMETRY", code))
         self.settings_page.script_generated.connect(self.script_editor.append_code)
         self.tallies_page.script_generated.connect(self.script_editor.append_code)
+
+        # --- Use the new smart function for the libraries page ---
+        self.libraries_page.script_generated.connect(self.insert_library_code_at_top)
 
         self.win_materials = self._create_popup_window("Materials Editor", self.materials_page)
         self.win_settings = self._create_popup_window("Simulation Settings", self.settings_page)
@@ -663,8 +697,11 @@ class MainWindow(QMainWindow):
 
         geom_layout.addLayout(macro_layout)
         geom_layout.addWidget(self.geometry_page)
-        self.depletion_page = DepletionPageWidget()
-        self.depletion_page.script_generated.connect(self.script_editor.append_code)
+
+        self.depletion_page = DepletionBurnupWidget()
+        if hasattr(self.depletion_page, 'script_generated'):
+            self.depletion_page.script_generated.connect(self.script_editor.append_code)
+
         self.win_depletion = self._create_popup_window("Burnup & Depletion", self.depletion_page)
 
     def _create_popup_window(self, title, widget):
@@ -942,7 +979,7 @@ class MainWindow(QMainWindow):
         self.action_xs_plot = QAction("📉 Cross Section Plotter", self)
         self.action_xs_plot.triggered.connect(lambda checked=False: self.open_xs_plotter())
 
-        # --- أوامر تغيير لون خلفية السكريبت ---
+        # --- Script background color commands ---
         self.action_bg_default = QAction("🟠 Default Orange", self)
         self.action_bg_default.triggered.connect(lambda checked=False: self.change_script_bg("#FF8C00", "#000000"))
 
@@ -958,7 +995,7 @@ class MainWindow(QMainWindow):
         self.action_bg_hacker = QAction("🌲 Terminal Green", self)
         self.action_bg_hacker.triggered.connect(lambda checked=False: self.change_script_bg("#051505", "#00FF41"))
 
-        # --- أوامر القوالب الجاهزة ---
+        # --- Built-in template commands ---
         self.act_ex_pwr = QAction("PWR Pin Cell", self)
         self.act_ex_pwr.triggered.connect(lambda checked=False: self.load_example("PWR Pin Cell"))
 
@@ -989,7 +1026,7 @@ class MainWindow(QMainWindow):
         self.act_ex_8 = QAction("HTGR Fuel Compact", self)
         self.act_ex_8.triggered.connect(lambda checked=False, _name="HTGR Fuel Compact": self.load_example(_name))
 
-        # --- أوامر الانتقال بين مساحات العمل ---
+        # --- Workspace switching commands ---
         self.act_ws_2d = QAction("🎨 2D Geometry Viewer", self)
         self.act_ws_2d.triggered.connect(lambda checked=False: self.visual_tabs.setCurrentIndex(1))
 
@@ -1738,7 +1775,7 @@ settings.source = openmc.IndependentSource(
 )
 """
 
-    # --- حفظ المشروع بصيغة JSON المتقدمة ---
+    # --- Save project in advanced JSON format ---
     def save_project(self, filepath=None):
         if not filepath:
             filepath, _ = QFileDialog.getSaveFileName(self, "Save Project", "",
@@ -1750,7 +1787,7 @@ settings.source = openmc.IndependentSource(
                 now_str = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
 
                 if filepath.endswith('.omcs'):
-                    # حفظ كقاعدة بيانات JSON لضمان حفظ حالة الواجهات (إن وجدت)
+                    # Save as JSON database to ensure UI states are saved (if any)
                     ui_state = {}
                     for name, widget in [
                         ('materials', self.materials_page),
@@ -1777,7 +1814,7 @@ settings.source = openmc.IndependentSource(
                     with open(filepath, 'w', encoding='utf-8') as f:
                         json.dump(project_data, f, indent=4)
                 else:
-                    # حفظ كملف بايثون عادي
+                    # Save as standard Python file
                     with open(filepath, 'w', encoding='utf-8') as f:
                         f.write(script_text)
 
@@ -1789,7 +1826,7 @@ settings.source = openmc.IndependentSource(
     def save_project_as(self):
         self.save_project(None)
 
-    # --- استعادة المشروع بذكاء (JSON أو بايثون عادي) ---
+    # --- Smart project restoration (JSON or standard Python) ---
     def open_project(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open Project", "",
                                                   "OpenMC Studio Project (*.omcs);;Python Files (*.py);;All Files (*)")
@@ -1808,7 +1845,7 @@ settings.source = openmc.IndependentSource(
                             script_text = project_data["script"]
                             is_full_project = True
 
-                            # استعادة حالة الواجهات
+                            # Restore UI states
                             ui_state = project_data.get("ui_state", {})
                             for name, widget in [
                                 ('materials', self.materials_page),
@@ -1826,7 +1863,7 @@ settings.source = openmc.IndependentSource(
                             if 'project_manager' in project_data and hasattr(self.project_manager, 'from_dict'):
                                 self.project_manager.from_dict(project_data['project_manager'])
                     except json.JSONDecodeError:
-                        pass  # إذا كان ملفاً قديماً لا يدعم JSON، افتحه كالمعتاد
+                        pass  # If it's an old file that doesn't support JSON, open it as usual
 
                 if hasattr(self.script_editor, 'editor') and hasattr(self.script_editor.editor, 'setPlainText'):
                     self.script_editor.editor.setPlainText(script_text)
