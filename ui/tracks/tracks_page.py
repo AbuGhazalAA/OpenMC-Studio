@@ -26,7 +26,17 @@ import matplotlib.image as mpimg
 import matplotlib.patheffects as pe
 
 from ui.plots.plots_page import ZoomableImageViewer
-from ui.tracks.tracks_help import TracksHelpDialog
+
+# Help is an extra, not a dependency. If tracks_help.py is missing -- most
+# likely because tracks_page.py was updated on its own -- the tab must
+# still load and run; only the Help button should notice. Letting the
+# import fail here took the whole Particle Tracks tab down with it.
+try:
+    from ui.tracks.tracks_help import TracksHelpDialog
+    _HELP_IMPORT_ERROR = None
+except Exception as _help_err:      # pragma: no cover - depends on install
+    TracksHelpDialog = None
+    _HELP_IMPORT_ERROR = _help_err
 
 
 # Color coding matches common HP/ViSED-style conventions (not an OpenMC
@@ -1533,9 +1543,13 @@ class TracksPageWidget(QWidget):
         # relevant help section is one click away instead of buried behind
         # the button at the top of a panel the user may have scrolled past.
         box.addButton(QMessageBox.StandardButton.Ok)
-        help_button = box.addButton("Open Help", QMessageBox.ButtonRole.HelpRole)
+        # Offered only when help is actually installed -- otherwise the
+        # button would route back into show_help, which reports the missing
+        # help through this same method, and the two would call each other.
+        help_button = (box.addButton("Open Help", QMessageBox.ButtonRole.HelpRole)
+                       if TracksHelpDialog is not None else None)
         box.exec()
-        if box.clickedButton() is help_button:
+        if help_button is not None and box.clickedButton() is help_button:
             self.show_help(help_anchor)
 
     def _parse_fields(self):
@@ -1612,6 +1626,17 @@ class TracksPageWidget(QWidget):
         so a second press raises the existing window instead of stacking
         another copy on top of it.
         """
+        if TracksHelpDialog is None:
+            self._fail(
+                "Help Is Not Installed",
+                "The help text could not be loaded:\n"
+                f"{_HELP_IMPORT_ERROR}\n\n"
+                "The file 'tracks_help.py' is missing from the 'ui/tracks' "
+                "folder, or was saved under a different name. Everything else "
+                "on this page works without it.\n\n"
+                "To install it, place tracks_help.py next to tracks_page.py "
+                "in ui/tracks/ and restart OpenMC Studio.")
+            return
         if getattr(self, '_help_dialog', None) is None:
             self._help_dialog = TracksHelpDialog(self)
         self._help_dialog.show_section(anchor)
