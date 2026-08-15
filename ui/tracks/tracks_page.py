@@ -26,6 +26,7 @@ import matplotlib.image as mpimg
 import matplotlib.patheffects as pe
 
 from ui.plots.plots_page import ZoomableImageViewer
+from ui.tracks.tracks_help import TracksHelpDialog
 
 
 # Color coding matches common HP/ViSED-style conventions (not an OpenMC
@@ -1229,6 +1230,17 @@ class TracksPageWidget(QWidget):
         left_panel = QWidget()
         form = QFormLayout(left_panel)
 
+        # Help first, so it is the first thing a new user sees rather than
+        # something to hunt for after the plot has already confused them.
+        self.btn_help = QPushButton("❓ Help — How Particle Tracking Works")
+        self.btn_help.setStyleSheet(
+            "background-color: #0e7490; color: white; font-weight: bold; padding: 6px;")
+        self.btn_help.setToolTip(
+            "Full guide to this page: every control, how to read the plot,\n"
+            "and what to do when it does not look right.")
+        self.btn_help.clicked.connect(self.show_help)
+        form.addRow(self.btn_help)
+
         self.basis_combo = QComboBox()
         self.basis_combo.addItems(["xy", "xz", "yz"])
         form.addRow("Basis (Plane):", self.basis_combo)
@@ -1493,7 +1505,7 @@ class TracksPageWidget(QWidget):
             pass
         print(msg)
 
-    def _fail(self, title, message):
+    def _fail(self, title, message, help_anchor="trouble"):
         """Report a failure BOTH in the console log and in a dialog.
 
         Every failure path on this page used to end at a single _log()
@@ -1517,7 +1529,14 @@ class TracksPageWidget(QWidget):
         else:
             box.setText(message)
         box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # A failure is exactly when the explanation is worth having, so the
+        # relevant help section is one click away instead of buried behind
+        # the button at the top of a panel the user may have scrolled past.
+        box.addButton(QMessageBox.StandardButton.Ok)
+        help_button = box.addButton("Open Help", QMessageBox.ButtonRole.HelpRole)
         box.exec()
+        if box.clickedButton() is help_button:
+            self.show_help(help_anchor)
 
     def _parse_fields(self):
         o_str = self.origin_field.text().strip()
@@ -1585,6 +1604,17 @@ class TracksPageWidget(QWidget):
         moved = list(origin)
         moved[n_idx] = self._slice_position()
         return tuple(moved)
+
+    def show_help(self, anchor="contents"):
+        """Open the help window, optionally at one section.
+
+        Held as an attribute so it is not garbage-collected while open, and
+        so a second press raises the existing window instead of stacking
+        another copy on top of it.
+        """
+        if getattr(self, '_help_dialog', None) is None:
+            self._help_dialog = TracksHelpDialog(self)
+        self._help_dialog.show_section(anchor)
 
     def _parse_optional_float(self, text):
         text = (text or '').strip()
@@ -1757,12 +1787,13 @@ class TracksPageWidget(QWidget):
                 "Script Is Empty",
                 "There is no model to track.\n\n"
                 "Build a model first (Materials, Geometry, Settings) or open an "
-                "existing script, then run the tracked simulation.")
+                "existing script, then run the tracked simulation.",
+                help_anchor="quick")
             return
 
         origin, width, pixels, err = self._parse_fields()
         if err:
-            self._fail("Invalid Plot Settings", err)
+            self._fail("Invalid Plot Settings", err, help_anchor="view")
             return
 
         export_root = os.path.abspath(os.path.join(os.getcwd(), "export"))
@@ -1871,7 +1902,8 @@ class TracksPageWidget(QWidget):
                 "The run finished, but OpenMC recorded no particle positions at all.\n\n"
                 "This usually means the source produced no particles inside the "
                 "geometry. Check that settings.source is defined and that its "
-                "position lies inside a cell of the model.")
+                "position lies inside a cell of the model.",
+                help_anchor="trouble")
             return
 
         mins = np.asarray(diagnostics.get('mins'), dtype=float)
@@ -1902,7 +1934,8 @@ class TracksPageWidget(QWidget):
                     "This means each particle was absorbed at the moment it was "
                     "born. It is a real physical result, not a display error: "
                     "check the source energy and the material at the source "
-                    "position.")
+                    "position.",
+                    help_anchor="trouble")
             return
 
         # Centre the view on the tracks and pad the span by 10% so the
