@@ -260,15 +260,17 @@ class ResultsPageWidget(QWidget):
         # readers, and collapse in greyscale printing.
         self.combo_colormap.addItems([
             "viridis", "inferno", "magma", "plasma", "cividis", "turbo",
-            "coolwarm", "hot", "terrain", "jet (not recommended)",
-            "rainbow (not recommended)"])
+            "coolwarm", "hot", "terrain", "jet", "rainbow"])
         self.combo_colormap.setToolTip(
             "viridis / inferno / magma / plasma / cividis are perceptually\n"
-            "uniform: equal steps in the data look like equal steps in colour.\n"
-            "cividis also stays readable for colour-blind viewers.\n\n"
-            "jet and rainbow are not recommended: their brightness rises and\n"
-            "falls along the scale, so they show sharp bands where the data is\n"
-            "smooth and hide detail elsewhere.")
+            "uniform: equal steps in the data are equal steps in colour, and\n"
+            "cividis stays readable for colour-blind viewers.\n\n"
+            "turbo gives rainbow's high contrast with lightness that rises\n"
+            "steadily, so it separates levels sharply without inventing edges.\n\n"
+            "jet and rainbow look crisp because their brightness rises AND\n"
+            "falls along the scale -- that contrast is real, but some of the\n"
+            "boundaries it draws are not in the data. Useful for spotting a\n"
+            "level quickly; check any sharp edge against the numbers.")
         mesh_row.addWidget(self.combo_colormap)
 
         self.chk_overlay_geom = QCheckBox("Overlay Geometry")
@@ -310,9 +312,26 @@ class ResultsPageWidget(QWidget):
         combo_layout.addStretch()
 
         # Raw data table
+        # The raw per-bin table is reference material, not the result. On a
+        # mesh tally its first rows are the corner cells, which are usually
+        # zero, so it filled the panel with a wall of 0.00000e+00 while the
+        # plot did the actual work. Collapsed by default; still populated,
+        # so it is one click away when a specific bin needs checking.
+        self.btn_toggle_table = QPushButton("▶  Show raw data table")
+        self.btn_toggle_table.setStyleSheet(
+            "text-align: left; padding: 4px; color: #555; font-weight: normal;")
+        self.btn_toggle_table.setToolTip(
+            "The per-bin listing behind the plot. Rarely needed -- use\n"
+            "'Export Table (CSV)' to take the whole thing into Excel.")
+        self.btn_toggle_table.clicked.connect(self._toggle_data_table)
+        tally_layout.addWidget(self.btn_toggle_table)
+
         self.table_tally = QTableWidget()
         self.table_tally.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table_tally.setStyleSheet("font-weight: normal; font-size: 12px;")
+        self._table_expanded = False
+        self.table_tally.setVisible(False)
+        self.table_tally.setMaximumHeight(280)
         tally_layout.addWidget(self.table_tally)
 
         layout.addWidget(tally_group)
@@ -324,6 +343,20 @@ class ResultsPageWidget(QWidget):
         self.btn_open_hpge.setVisible(False)
         self.btn_open_hpge.clicked.connect(self.show_hpge_dialog)
         layout.addWidget(self.btn_open_hpge)
+
+    def _toggle_data_table(self):
+        """Flip the raw table open or closed.
+
+        The state is tracked explicitly rather than read back from
+        isVisible(): that reports False whenever any ancestor is hidden --
+        while the Results tab is in the background, for instance -- so
+        toggling from it would get stuck always opening.
+        """
+        self._table_expanded = not getattr(self, '_table_expanded', False)
+        self.table_tally.setVisible(self._table_expanded)
+        self.btn_toggle_table.setText(
+            "▼  Hide raw data table" if self._table_expanded
+            else "▶  Show raw data table")
 
     def _setup_tally_plot_dialog(self):
         """Setup independent plot window"""
@@ -1534,23 +1567,34 @@ class ResultsPageWidget(QWidget):
         tally_id = self.combo_tallies.currentData()
 
         if tally_id == -1:
+            # Read from the stored depletion arrays rather than scraping the
+            # table widget: the numbers survive at full precision instead of
+            # being round-tripped through the strings shown on screen, and
+            # the export no longer breaks when the table is collapsed.
             try:
-                rows = self.table_tally.rowCount()
-                cols = self.table_tally.columnCount()
-                data = []
-                for r in range(rows):
-                    row_data = []
-                    for c in range(cols):
-                        item = self.table_tally.item(r, c)
-                        row_data.append(item.text() if item else "")
-                    data.append(row_data)
-                df = pd.DataFrame(data, columns=["Time [Days]", "k-effective", "Std Dev"])
+                d = getattr(self, '_depletion_data', {}) or {}
+                if not d:
+                    QMessageBox.warning(self, "Warning", "No depletion results are loaded.")
+                    return
+                columns = {
+                    "Time [Days]": d['time_days'],
+                    "k_effective": d['k_val'],
+                    "k_std_dev": d['k_err'],
+                }
+                if d.get('burnup') is not None:
+                    columns["Burnup [MWd/kgHM]"] = d['burnup']
+                rho, rho_err = _reactivity_pcm(d['k_val'], d['k_err'])
+                columns["Reactivity [pcm]"] = rho
+                columns["Reactivity_std_dev [pcm]"] = rho_err
+                df = pd.DataFrame({k: pd.Series(v) for k, v in columns.items()})
                 save_path, _ = QFileDialog.getSaveFileName(
-                    self, "Save Excel CSV", os.path.join(os.getcwd(), "Depletion_Results.csv"), "CSV Files (*.csv)"
-                )
+                    self, "Save Depletion Results",
+                    os.path.join(os.getcwd(), "Depletion_Results.csv"), "CSV Files (*.csv)")
                 if save_path:
                     df.to_csv(save_path, index=False)
                     self.lbl_file.setText(f"✅ Exported successfully to: {os.path.basename(save_path)}")
+                    self._log(f"✅ Depletion results exported ({len(df)} steps, "
+                              f"{len(df.columns)} columns).")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Export Error: {e}")
             return
@@ -1919,7 +1963,6 @@ class ResultsPageWidget(QWidget):
                 # painting it the bottom colour makes emptiness look like a
                 # measured minimum.
                 Zm = np.ma.masked_where(~(np.isfinite(Z) & (Z > 0)), Z)
-                clipped = False
 
                 if is_log_scale:
                     vmin, vmax = float(positive.min()), float(positive.max())
@@ -1929,20 +1972,19 @@ class ResultsPageWidget(QWidget):
                     levels = np.logspace(np.log10(vmin), np.log10(vmax),
                                          25 if mesh_style == "Filled Contour" else 12)
                 else:
+                    # The full measured range, with nothing trimmed. An
+                    # earlier version clipped this to the 1st-99th percentile
+                    # to keep low-level structure visible, but contour levels
+                    # that stop below the maximum simply do not draw the cells
+                    # above them: the peak -- the most important part of the
+                    # plot -- came out as a white hole. A linear scale over
+                    # data spanning decades genuinely does look flat, and
+                    # saying so through the Auto default is honest, where
+                    # quietly hiding the peak is not.
                     if positive.size:
-                        # A linear scale over decades of data puts everything
-                        # but the peak in the bottom colour, which is why a
-                        # linear plot of a flux looks like a single bright
-                        # dot. Clipping to the 1st-99th percentile keeps the
-                        # structure visible; the colour bar says so.
-                        vmin = float(np.percentile(positive, 1))
-                        vmax = float(np.percentile(positive, 99))
-                        clipped = bool(vmin > positive.min() or vmax < positive.max())
+                        vmin, vmax = float(positive.min()), float(positive.max())
                         if vmax <= vmin:
-                            vmin, vmax = float(positive.min()), float(positive.max())
-                            clipped = False
-                        if vmax <= vmin:
-                            vmax = vmin + 1.0
+                            vmax = vmin + abs(vmin) * 0.1 + 1e-30
                     else:
                         vmin, vmax = 0.0, 1.0
                     norm = Normalize(vmin=vmin, vmax=vmax)
@@ -1953,11 +1995,14 @@ class ResultsPageWidget(QWidget):
                     im = ax.imshow(Zm, origin='lower', extent=extent, cmap=cmap,
                                    norm=norm, interpolation='nearest', alpha=alpha_val)
                 elif mesh_style == "Filled Contour":
+                    # extend='both' so a cell sitting exactly on -- or, through
+                    # floating point, just outside -- the first or last level
+                    # still gets a colour instead of being left blank.
                     im = ax.contourf(X, Y, Zm, levels=levels, cmap=cmap, norm=norm,
-                                     alpha=alpha_val)
+                                     alpha=alpha_val, extend='both')
                 else:
                     im = ax.contour(X, Y, Zm, levels=levels, cmap=cmap, norm=norm,
-                                    linewidths=1.5, alpha=alpha_val)
+                                    linewidths=1.5, alpha=alpha_val, extend='both')
 
                 # Equal aspect keeps 1 cm on X the same length as 1 cm on Y.
                 # Without it a circular detector is drawn as an ellipse,
@@ -1978,10 +2023,7 @@ class ResultsPageWidget(QWidget):
                     tick_vals = np.linspace(vmin, vmax, 6)
                 bar = fig.colorbar(im, ax=ax, ticks=tick_vals)
                 bar.ax.set_yticklabels([f"{t:.2e}" for t in tick_vals])
-                bar_label = f'{score} [per source particle]'
-                if clipped:
-                    bar_label += '\n(linear, clipped to 1st-99th percentile)'
-                bar.set_label(bar_label)
+                bar.set_label(f'{score} [per source particle]')
 
                 axis_labels = ['X', 'Y', 'Z']
                 ax.set_xlabel(f'{axis_labels[h_axis]} [cm]', fontweight='bold')
