@@ -10,7 +10,7 @@ import openmc
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QFormLayout, QSplitter, QSpinBox, QApplication, QCheckBox,
-    QDialog, QProgressBar, QMessageBox
+    QDialog, QProgressBar, QMessageBox, QScrollArea
 )
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 from PySide6.QtGui import QPixmap
@@ -1258,9 +1258,24 @@ class TracksPageWidget(QWidget):
         self.viewer = ZoomableImageViewer()
         self.viewer.setMinimumSize(400, 400)
 
-        splitter.addWidget(left_panel)
+        # The control column grew past the height of a 768-pixel screen, so
+        # the Run button fell off the bottom with no way to reach it. A
+        # scroll area keeps every control reachable at any window height.
+        # setWidgetResizable makes the panel follow the splitter's width
+        # instead of staying at its size hint, so only a VERTICAL bar
+        # appears -- a horizontal one would just hide the labels instead.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(left_panel)
+        controls_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setMinimumWidth(260)
+
+        splitter.addWidget(controls_scroll)
         splitter.addWidget(self.viewer)
-        splitter.setSizes([300, 700])
+        splitter.setSizes([320, 700])
         layout.addWidget(splitter)
 
     def _log(self, msg):
