@@ -10,7 +10,7 @@ import openmc
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QFormLayout, QSplitter, QSpinBox, QApplication, QCheckBox,
-    QDialog, QProgressBar, QMessageBox, QScrollArea
+    QDialog, QProgressBar, QMessageBox, QScrollArea, QSlider, QFileDialog
 )
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 from PySide6.QtGui import QPixmap
@@ -292,12 +292,38 @@ def _collision_indices(states, n_states):
     return np.flatnonzero(same_cell) + 1
 
 
+def _classify_fate(last_point, model_bbox):
+    """'escaped' if a particle's final position sits on (or beyond) the
+    model's outer boundary, 'absorbed' if it stopped inside, None when the
+    model has no finite bounding box to compare against.
+
+    The track file records positions, not why a history ended, so the
+    boundary is what separates "left the problem" from "stopped here" --
+    and it is the distinction shielding work actually needs.
+    """
+    if model_bbox is None:
+        return None
+    lower, upper = np.asarray(model_bbox[0], dtype=float), np.asarray(model_bbox[1], dtype=float)
+    if not (np.all(np.isfinite(lower)) and np.all(np.isfinite(upper))):
+        return None
+    span = float(np.max(upper - lower))
+    if not np.isfinite(span) or span <= 0:
+        return None
+    tol = 1e-3 * span
+    beyond = np.any(last_point < lower - tol) or np.any(last_point > upper + tol)
+    on_face = np.any((np.abs(last_point - lower) <= tol) |
+                     (np.abs(last_point - upper) <= tol))
+    return 'escaped' if (beyond or on_face) else 'absorbed'
+
+
 def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_path,
                      show_tracks=True, show_source=True, show_collisions=True,
                      source_marker_size=7, reveal_fraction=1.0, reveal_time=None, dpi=150,
                      slab_thickness=None, color_mode='particle',
                      collision_mode='points', collision_marker_size=5,
-                     show_primaries=True, show_secondaries=True, heatmap_bins=60):
+                     show_primaries=True, show_secondaries=True, heatmap_bins=60,
+                     energy_min=None, energy_max=None,
+                     show_fate=False, model_bbox=None):
     """Composite the background geometry PNG with real particle-track
     polylines, source-birth markers, and interaction points, all aligned in
     PHYSICAL (cm) coordinates via matplotlib's `extent` -- this sidesteps
@@ -334,6 +360,19 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
     secondaries they create (Compton electrons, fluorescence photons).
     Secondaries usually outnumber primaries several times over, so being
     able to drop them is often what makes a plot readable at all.
+
+    `energy_min` / `energy_max` (eV) keep only the states recorded inside
+    that window. This is applied per STATE, not per track, so a photon that
+    starts at 1 MeV and degrades to 50 keV appears only along the stretch
+    where it was still above the threshold -- which is what separates the
+    penetrating radiation that matters for shielding from the low-energy
+    scatter filling the same space.
+
+    `show_fate` marks where each particle history ended, split by whether
+    it escaped the model or stopped inside it, using `model_bbox`
+    (lower_left, upper_right from openmc.Geometry.bounding_box).
+
+    Returns a dict of counts describing what was actually drawn.
 
     `reveal_time`, when given (absolute seconds, matching states['time']),
     truncates each track to only the states recorded at or before that
@@ -378,6 +417,8 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
     single_points = []   # (h, v, pname)
     source_points = []   # (h, v, pname)
     collision_points = []  # (h, v, pname)
+    fate_points = {'escaped': [], 'absorbed': []}
+    fate_counts = {'escaped': 0, 'absorbed': 0, 'unknown': 0}
 
     for track in tracks:
         for i, ptrack in enumerate(track.particle_tracks):
@@ -409,17 +450,35 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
                 in_slab = np.abs(r[:, n_idx] - origin[n_idx]) <= (slab_thickness / 2.0)
             else:
                 in_slab = np.ones(r.shape[0], dtype=bool)
-            if not in_slab.any():
+
+            # Energy window, applied per state so a track appears only
+            # along the stretch where it was still inside the window.
+            visible = in_slab
+            if energy_min is not None:
+                visible = visible & (energies >= energy_min)
+            if energy_max is not None:
+                visible = visible & (energies <= energy_max)
+            if not visible.any():
                 continue
 
             h_all, v_all = r[:, h_idx], r[:, v_idx]
 
-            if show_source and is_primary and in_slab[0]:
+            # Where this history ended. Classified from the last recorded
+            # state regardless of the energy window (the fate is a property
+            # of the history, not of the slice being viewed), but only
+            # drawn when that point is inside the slab being shown.
+            if show_fate and r.shape[0] >= 1:
+                fate = _classify_fate(r[-1], model_bbox)
+                fate_counts[fate if fate else 'unknown'] += 1
+                if fate and in_slab[-1]:
+                    fate_points[fate].append((h_all[-1], v_all[-1], pname))
+
+            if show_source and is_primary and visible[0]:
                 source_points.append((h_all[0], v_all[0], pname))
 
             if show_collisions:
                 hit_idx = _collision_indices(ptrack.states, r.shape[0])
-                hit_idx = hit_idx[in_slab[hit_idx]]
+                hit_idx = hit_idx[visible[hit_idx]]
                 for k in hit_idx:
                     collision_points.append((h_all[k], v_all[k], pname))
 
@@ -429,7 +488,7 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
             # Each run of consecutive in-slab states is its own polyline;
             # a run of one state has no segment to draw, so it becomes a
             # point instead of being dropped silently.
-            for start, stop in _contiguous_runs(in_slab):
+            for start, stop in _contiguous_runs(visible):
                 if stop - start < 2:
                     single_points.append((h_all[start], v_all[start], pname))
                     continue
@@ -504,6 +563,18 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
                 markeredgewidth=0.7, zorder=6,
                 path_effects=[pe.withStroke(linewidth=1.8, foreground='white')])
 
+    # End-of-history markers. Escaped is drawn hollow (the particle left --
+    # nothing remains there) and absorbed solid (the energy stopped here),
+    # in fixed colours rather than per particle type, because the question
+    # they answer is about fate, not species.
+    for h, v, _pname in fate_points['absorbed']:
+        ax.plot(h, v, marker='s', color='#b91c1c', markersize=5,
+                markeredgecolor='white', markeredgewidth=0.6, zorder=7)
+    for h, v, _pname in fate_points['escaped']:
+        ax.plot(h, v, marker='^', markerfacecolor='none',
+                markeredgecolor='#0ea5e9', markersize=6, markeredgewidth=1.4,
+                zorder=7)
+
     collision_mesh = None
     if collision_points:
         ch = np.array([c[0] for c in collision_points])
@@ -527,6 +598,7 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
                         path_effects=[pe.withStroke(linewidth=1.5, foreground='white')])
 
     # \u2500\u2500 Legend / colour bars \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    handles = []
     if energy_norm is not None:
         bar = fig.colorbar(ScalarMappable(norm=energy_norm, cmap=cmap),
                            ax=ax, fraction=0.046, pad=0.03)
@@ -538,6 +610,17 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
         if show_primaries and show_secondaries and any(not p[4] for p in polylines):
             handles.append(Line2D([], [], color='#444444', linewidth=1.0,
                                   linestyle=(0, (3, 2)), label='Secondary'))
+
+    # Fate keys are worth showing even in energy mode, where the colour bar
+    # replaces the particle legend but says nothing about how tracks ended.
+    if fate_points['absorbed']:
+        handles.append(Line2D([], [], linestyle='none', marker='s', color='#b91c1c',
+                              markersize=5, label=f"Absorbed ({fate_counts['absorbed']})"))
+    if fate_points['escaped']:
+        handles.append(Line2D([], [], linestyle='none', marker='^',
+                              markerfacecolor='none', markeredgecolor='#0ea5e9',
+                              markersize=6, label=f"Escaped ({fate_counts['escaped']})"))
+    if handles:
         ax.legend(handles=handles, loc='upper right', fontsize=8, framealpha=0.85)
 
     if collision_mesh is not None:
@@ -560,6 +643,10 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
         title_bits.append("primaries only")
     elif not show_primaries:
         title_bits.append("secondaries only")
+    if energy_min is not None or energy_max is not None:
+        lo = f"{energy_min:.3g}" if energy_min is not None else "0"
+        hi = f"{energy_max:.3g}" if energy_max is not None else "\u221e"
+        title_bits.append(f"E in [{lo}, {hi}] eV")
     suffix = (" -- " + ", ".join(title_bits)) if title_bits else ""
 
     normal_axis = 'XYZ'[n_idx]
@@ -574,6 +661,94 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
     fig.clear()  # drop all axes/artists now rather than waiting for GC,
                  # since this function may be called many times in a row
                  # (once per animation frame) within a single run
+
+    return {
+        'polylines': len(polylines),
+        'source_points': len(source_points),
+        'collisions': len(collision_points),
+        'escaped': fate_counts['escaped'],
+        'absorbed': fate_counts['absorbed'],
+        'fate_unknown': fate_counts['unknown'],
+    }
+
+
+def _generate_background_plot(track_dir, basis, origin, width, pixels, color_by,
+                              filename='tracks_bg', log=None):
+    """Render the geometry slice OpenMC draws under the tracks.
+
+    Returns (png_path, error_text); error_text is None on success.
+
+    Extracted from the simulation worker because the slice-position slider
+    needs it too: moving the tracks' slab without moving the background
+    would put the tracks over a picture of a different plane -- exactly the
+    mismatch the slab filter exists to remove.
+
+    An OpenMC built WITHOUT libpng -- including the Windows v0.16.0 build
+    this app is commonly used with -- writes its plot as a .ppm, not a
+    .png, and still exits 0. Waiting for a .png that is never going to
+    appear reported "failed after 3 attempts (exit code 0)" on a plot run
+    that had in fact succeeded, so the .ppm is converted with Pillow, as
+    ui/plots/plots_page.py already does.
+
+    Retry on failure: a libpng "Write Error" can be a passing hiccup
+    (antivirus real-time scan, cloud sync, Windows Search indexing briefly
+    locking the file), OR -- if retrying alone doesn't help -- a corrupted
+    file LEFT BEHIND by the failed attempt, which then makes every later
+    attempt fail the same way. Deleting before each attempt guarantees a
+    clean slate either way.
+    """
+    plot = openmc.Plot()
+    plot.filename = filename
+    plot.basis = basis
+    plot.origin = tuple(origin)
+    plot.width = tuple(width)
+    plot.pixels = tuple(pixels)
+    plot.color_by = color_by
+    openmc.Plots([plot]).export_to_xml(os.path.join(track_dir, "plots.xml"))
+
+    png_path = os.path.join(track_dir, f"{filename}.png")
+    ppm_path = os.path.join(track_dir, f"{filename}.ppm")
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+    max_attempts = 3
+    plot_result = None
+    convert_error = None
+    for attempt in range(1, max_attempts + 1):
+        for stale in (png_path, ppm_path):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass  # if this itself is locked, let the write attempt surface that
+        plot_result = subprocess.run(
+            ["openmc", "--plot"], cwd=track_dir, capture_output=True, text=True,
+            creationflags=creationflags)
+        if not os.path.exists(png_path) and os.path.exists(ppm_path):
+            try:
+                from PIL import Image
+                with Image.open(ppm_path) as im:
+                    im.save(png_path, "PNG")
+                if log is not None:
+                    log("[OpenMC Studio] This OpenMC build wrote a .ppm plot "
+                        "(no libpng); converted it to .png.")
+            except Exception as conv_err:
+                convert_error = conv_err
+        if plot_result.returncode == 0 and os.path.exists(png_path):
+            return png_path, None
+        if attempt < max_attempts:
+            time.sleep(0.6 * attempt)
+
+    details = (plot_result.stderr or plot_result.stdout or "(no output captured)").strip()
+    if convert_error is not None:
+        details = (f"OpenMC wrote {os.path.basename(ppm_path)}, but converting it "
+                   f"to PNG failed: {convert_error}\n"
+                   f"Pillow is required to read this build's plot output "
+                   f"(pip install Pillow).\n\n") + details
+    elif os.path.exists(ppm_path):
+        details = ("OpenMC produced a .ppm plot that could not be converted "
+                   "to PNG.\n\n") + details
+    return None, (f"Background plot generation failed after {max_attempts} attempts "
+                  f"(exit code {plot_result.returncode}):\n{details}")
 
 
 def _looks_transient_io_error(text):
@@ -639,6 +814,7 @@ class TrackSimulationWorker(QThread):
         self.tracks = None
         self.geometry_png = None
         self.t_max = 0.0
+        self.model_bbox = None
 
     def run(self):
         try:
@@ -670,6 +846,17 @@ class TrackSimulationWorker(QThread):
             if err:
                 self.finished_signal.emit(False, err, [], {})
                 return
+
+            # The model's outer boundary, used to tell a particle that left
+            # the problem from one that stopped inside it. Unbounded models
+            # give infinities, in which case fate stays unclassified rather
+            # than guessed.
+            try:
+                bbox = geometry.bounding_box
+                self.model_bbox = (np.asarray(bbox[0], dtype=float),
+                                   np.asarray(bbox[1], dtype=float))
+            except Exception:
+                self.model_bbox = None
 
             # Override settings for a FAST, track-focused run only -- this
             # writes exclusively into export/tracks/, never touching the
@@ -782,81 +969,11 @@ class TrackSimulationWorker(QThread):
             # colliding with that page's own file of the same name, even
             # if some quirk of this build's cwd handling ever pointed
             # both at the same location.
-            plot = openmc.Plot()
-            plot.filename = 'tracks_bg'
-            plot.basis = self.basis
-            plot.origin = self.origin
-            plot.width = self.width
-            plot.pixels = self.pixels
-            plot.color_by = self.color_by
-            openmc.Plots([plot]).export_to_xml(os.path.join(track_dir, "plots.xml"))
-
-            geometry_png = os.path.join(track_dir, "tracks_bg.png")
-            geometry_ppm = os.path.join(track_dir, "tracks_bg.ppm")
-
-            # An OpenMC built WITHOUT libpng -- which includes the Windows
-            # v0.16.0 build this app is commonly used with -- writes its
-            # plot as a .ppm, not a .png, and still exits 0. Waiting for a
-            # .png that is never going to appear made this page retry three
-            # times and then report "failed after 3 attempts (exit code 0)"
-            # on a plot run that had in fact succeeded. ui/plots/plots_page.py
-            # already converts the .ppm with Pillow, which is exactly why
-            # the 2D Geometry Viewer worked while this page did not; the
-            # same conversion is done here.
-            #
-            # Retry on failure: a libpng "Write Error" can be a passing
-            # hiccup (antivirus real-time scan, OneDrive/cloud sync,
-            # Windows Search indexing briefly locking the file), OR --
-            # if retrying alone doesn't help -- a corrupted/partially
-            # written file LEFT BEHIND by the failed attempt itself,
-            # which then makes every subsequent attempt fail the same
-            # way. Deleting any existing file before each attempt
-            # guarantees a genuinely clean slate every time either way.
-            # Same creationflags fix as the transport run above.
-            max_attempts = 3
-            plot_result = None
-            convert_error = None
-            for attempt in range(1, max_attempts + 1):
-                for stale in (geometry_png, geometry_ppm):
-                    if os.path.exists(stale):
-                        try:
-                            os.remove(stale)
-                        except OSError:
-                            pass  # if this itself is locked, let the write attempt surface that
-                plot_result = subprocess.run(
-                    ["openmc", "--plot"], cwd=track_dir, capture_output=True, text=True,
-                    creationflags=creationflags
-                )
-                if not os.path.exists(geometry_png) and os.path.exists(geometry_ppm):
-                    try:
-                        from PIL import Image
-                        with Image.open(geometry_ppm) as im:
-                            im.save(geometry_png, "PNG")
-                        self.log_signal.emit(
-                            "[OpenMC Studio] This OpenMC build wrote a .ppm plot "
-                            "(no libpng); converted it to .png.")
-                    except Exception as conv_err:
-                        convert_error = conv_err
-                if plot_result.returncode == 0 and os.path.exists(geometry_png):
-                    break
-                if attempt < max_attempts:
-                    time.sleep(0.6 * attempt)
-
-            if plot_result.returncode != 0 or not os.path.exists(geometry_png):
-                details = (plot_result.stderr or plot_result.stdout or "(no output captured)").strip()
-                if convert_error is not None:
-                    details = (f"OpenMC wrote {os.path.basename(geometry_ppm)}, but converting it "
-                               f"to PNG failed: {convert_error}\n"
-                               f"Pillow is required to read this build's plot output "
-                               f"(pip install Pillow).\n\n") + details
-                elif os.path.exists(geometry_ppm):
-                    details = ("OpenMC produced a .ppm plot that could not be converted "
-                               "to PNG.\n\n") + details
-                self.finished_signal.emit(
-                    False,
-                    f"Background plot generation failed after {max_attempts} attempts "
-                    f"(exit code {plot_result.returncode}):\n{details}",
-                    [], {})
+            geometry_png, plot_err = _generate_background_plot(
+                track_dir, self.basis, self.origin, self.width, self.pixels,
+                self.color_by, log=self.log_signal.emit)
+            if plot_err:
+                self.finished_signal.emit(False, plot_err, [], {})
                 return
 
             # Prefer OpenMC's own reader -- it tracks any future change to
@@ -982,6 +1099,7 @@ class TrackSimulationWorker(QThread):
                                  reveal_fraction=fraction,
                                  reveal_time=(t_max * fraction) if t_max > 0 else None,
                                  dpi=150 if is_last else 80,
+                                 model_bbox=self.model_bbox,
                                  **self.display)
                 frame_paths.append(frame_path)
 
@@ -1028,7 +1146,7 @@ class TrackRedrawWorker(QThread):
     finished_signal = Signal(bool, str, str)  # success, message, frame path
 
     def __init__(self, tracks, geometry_png, basis, origin, width,
-                 out_path, display):
+                 out_path, display, model_bbox=None, replot=None):
         super().__init__()
         self.tracks = tracks
         self.geometry_png = geometry_png
@@ -1037,12 +1155,30 @@ class TrackRedrawWorker(QThread):
         self.width = width
         self.out_path = out_path
         self.display = dict(display)
+        self.model_bbox = model_bbox
+        # When the slice moves along the normal axis the background has to
+        # move with it. Redrawing tracks at a new depth over a picture of
+        # the original plane would reintroduce exactly the mismatch the
+        # slab filter exists to remove, so a re-plot is requested instead.
+        self.replot = replot
+        self.stats = {}
 
     def run(self):
         try:
-            _render_overlay(self.geometry_png, self.tracks, self.basis,
-                            self.origin, self.width, self.out_path,
-                            dpi=150, **self.display)
+            geometry_png = self.geometry_png
+            if self.replot:
+                new_png, err = _generate_background_plot(
+                    self.replot['track_dir'], self.basis, self.origin,
+                    self.width, self.replot['pixels'], self.replot['color_by'],
+                    filename='tracks_bg_slice')
+                if err:
+                    self.finished_signal.emit(False, err, "")
+                    return
+                geometry_png = new_png
+            self.stats = _render_overlay(
+                geometry_png, self.tracks, self.basis, self.origin,
+                self.width, self.out_path, dpi=150,
+                model_bbox=self.model_bbox, **self.display) or {}
             self.finished_signal.emit(True, "", self.out_path)
         except Exception as e:
             msg = str(e).strip() or f"{type(e).__name__} (no message attached)"
@@ -1198,6 +1334,16 @@ class TracksPageWidget(QWidget):
         # background slice are drawn on top of it as though they were in
         # it -- denser than the physics, and not matching the geometry
         # underneath.
+        self.chk_fate = QCheckBox("End of history (absorbed / escaped)")
+        self.chk_fate.setChecked(False)
+        self.chk_fate.setToolTip(
+            "Mark where each particle history ended:\n"
+            "  filled red square  -- stopped inside the model (absorbed)\n"
+            "  hollow blue triangle -- reached the outer boundary (escaped)\n"
+            "The legend carries the counts, which is the number a shielding\n"
+            "study is usually after: how much actually got through.")
+        form.addRow("", self.chk_fate)
+
         self.slab_field = QLineEdit("")
         self.slab_field.setPlaceholderText("blank = project all depth")
         self.slab_field.setToolTip(
@@ -1208,6 +1354,48 @@ class TracksPageWidget(QWidget):
             "plane -- convenient, but it shows tracks that are nowhere\n"
             "near the geometry slice drawn underneath them.")
         form.addRow("Slice Thickness (cm):", self.slab_field)
+
+        # Slice position. Redrawing no longer costs a transport run, so the
+        # slab can be swept through the model to explore it in depth -- the
+        # closest this 2D page gets to a 3D view. Moving it re-plots the
+        # geometry background at the new depth as well, which does cost an
+        # `openmc --plot`, hence sliderReleased rather than valueChanged.
+        slice_row = QWidget()
+        slice_layout = QHBoxLayout(slice_row)
+        slice_layout.setContentsMargins(0, 0, 0, 0)
+        self.slice_slider = QSlider(Qt.Orientation.Horizontal)
+        self.slice_slider.setEnabled(False)
+        self.slice_slider.setToolTip(
+            "Sweep the slice through the model along the axis the Basis\n"
+            "does not cover. Needs a Slice Thickness to be set, and a run\n"
+            "to have produced tracks. Releasing the handle re-plots the\n"
+            "geometry background at the new depth too, so the tracks and\n"
+            "the picture underneath always describe the same plane.")
+        self.slice_slider.sliderReleased.connect(self._on_slice_moved)
+        self.lbl_slice_pos = QLabel("--")
+        self.lbl_slice_pos.setMinimumWidth(64)
+        slice_layout.addWidget(self.slice_slider)
+        slice_layout.addWidget(self.lbl_slice_pos)
+        form.addRow("Slice Position:", slice_row)
+
+        # Energy window. Applied per state, so a photon that starts at
+        # 1 MeV and degrades appears only along the stretch where it was
+        # still above the threshold -- which is how the penetrating
+        # radiation gets separated from the low-energy scatter around it.
+        energy_row = QWidget()
+        energy_layout = QHBoxLayout(energy_row)
+        energy_layout.setContentsMargins(0, 0, 0, 0)
+        self.energy_min_field = QLineEdit("")
+        self.energy_min_field.setPlaceholderText("min eV")
+        self.energy_max_field = QLineEdit("")
+        self.energy_max_field.setPlaceholderText("max eV")
+        for field in (self.energy_min_field, self.energy_max_field):
+            field.setToolTip(
+                "Energy window in eV; leave either side blank for no limit.\n"
+                "Example: 100000 in 'min' shows only where particles were\n"
+                "still above 100 keV.")
+            energy_layout.addWidget(field)
+        form.addRow("Energy Filter:", energy_row)
 
         self.track_color_combo = QComboBox()
         self.track_color_combo.addItems(["Particle type", "Energy (log scale)"])
@@ -1222,13 +1410,14 @@ class TracksPageWidget(QWidget):
         # Redrawing needs only matplotlib and data already in memory, so
         # every one of these is instant -- no second transport run.
         for widget in (self.chk_tracks, self.chk_source, self.chk_collisions,
-                       self.chk_primaries, self.chk_secondaries):
+                       self.chk_primaries, self.chk_secondaries, self.chk_fate):
             widget.toggled.connect(self.redraw_from_cache)
         for widget in (self.source_size_spin, self.collision_size_spin):
             widget.valueChanged.connect(self.redraw_from_cache)
         for widget in (self.collision_mode_combo, self.track_color_combo):
             widget.currentIndexChanged.connect(self.redraw_from_cache)
-        self.slab_field.editingFinished.connect(self.redraw_from_cache)
+        for widget in (self.slab_field, self.energy_min_field, self.energy_max_field):
+            widget.editingFinished.connect(self.redraw_from_cache)
 
         self.btn_run = QPushButton("\U0001F3AF Run Tracked Simulation")
         self.btn_run.setStyleSheet(
@@ -1247,6 +1436,22 @@ class TracksPageWidget(QWidget):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         form.addRow(self.progress_bar)
+
+        save_row = QWidget()
+        save_layout = QHBoxLayout(save_row)
+        save_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_save_image = QPushButton("🖼 Save Image")
+        self.btn_save_image.setToolTip(
+            "Save the picture currently on screen as a PNG (1500x1500).")
+        self.btn_save_image.clicked.connect(self.save_current_image)
+        self.btn_save_gif = QPushButton("🎞 Save Animation")
+        self.btn_save_gif.setToolTip(
+            "Save the replay -- the frames that reveal the tracks by\n"
+            "elapsed simulation time -- as an animated GIF.")
+        self.btn_save_gif.clicked.connect(self.save_animation_gif)
+        save_layout.addWidget(self.btn_save_image)
+        save_layout.addWidget(self.btn_save_gif)
+        form.addRow("Export:", save_row)
 
         self.btn_append = QPushButton("\U0001F4BE Append Track Settings to Script")
         self.btn_append.setStyleSheet(
@@ -1360,9 +1565,124 @@ class TracksPageWidget(QWidget):
                            if self.track_color_combo.currentText().startswith("Energy")
                            else 'particle'),
             'slab_thickness': slab,
+            'show_fate': self.chk_fate.isChecked(),
+            'energy_min': self._parse_optional_float(self.energy_min_field.text()),
+            'energy_max': self._parse_optional_float(self.energy_max_field.text()),
         }
 
-    def redraw_from_cache(self):
+    def render_origin(self):
+        """The Origin to draw with: the typed one, but with the slice
+        normal replaced by the slider when it is active. Only the normal
+        component moves -- the in-plane components still frame the view."""
+        origin, _width, _pixels, err = self._parse_fields()
+        if err:
+            return None
+        if not self.slice_slider.isEnabled():
+            return origin
+        h_idx, v_idx = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}[
+            self.basis_combo.currentText()]
+        n_idx = 3 - h_idx - v_idx
+        moved = list(origin)
+        moved[n_idx] = self._slice_position()
+        return tuple(moved)
+
+    def _parse_optional_float(self, text):
+        text = (text or '').strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _on_slice_moved(self):
+        """Slider released: show the new depth and redraw (background too)."""
+        cache = getattr(self, '_track_cache', None)
+        if not cache:
+            return
+        self.lbl_slice_pos.setText(f"{self._slice_position():.2f} cm")
+        self.redraw_from_cache(replot_background=True)
+
+    def _slice_position(self):
+        """Slider value in cm along the slice normal."""
+        return self.slice_slider.value() / 100.0
+
+    def _configure_slice_slider(self, mins, maxs):
+        """Give the slider the model's own depth range.
+
+        Qt sliders are integers, so the range is held in hundredths of a
+        centimetre -- fine enough for any geometry this page renders.
+        """
+        h_idx, v_idx = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}[
+            self.basis_combo.currentText()]
+        n_idx = 3 - h_idx - v_idx
+        lo, hi = float(mins[n_idx]), float(maxs[n_idx])
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            self.slice_slider.setEnabled(False)
+            self.lbl_slice_pos.setText("--")
+            return
+        self.slice_slider.blockSignals(True)
+        self.slice_slider.setRange(int(lo * 100), int(hi * 100))
+        origin, _w, _p, err = self._parse_fields()
+        start = origin[n_idx] if not err else (lo + hi) / 2.0
+        self.slice_slider.setValue(int(np.clip(start, lo, hi) * 100))
+        self.slice_slider.blockSignals(False)
+        self.slice_slider.setEnabled(True)
+        self.lbl_slice_pos.setText(f"{self._slice_position():.2f} cm")
+
+    def save_current_image(self):
+        """Copy the picture on screen to wherever the user wants it."""
+        source = getattr(self, '_current_frame', None)
+        if not source or not os.path.exists(source):
+            self._fail("Nothing to Save",
+                       "There is no rendered image yet. Run a tracked "
+                       "simulation first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Track Image", "particle_tracks.png", "PNG Image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith('.png'):
+            path += '.png'
+        try:
+            shutil.copyfile(source, path)
+        except OSError as e:
+            self._fail("Could Not Save Image", str(e))
+            return
+        self._log(f"💾 Track image saved to {path}")
+
+    def save_animation_gif(self):
+        """Write the replay frames out as an animated GIF."""
+        frames = getattr(self, '_anim_frames', None)
+        if not frames:
+            self._fail("Nothing to Save",
+                       "There is no animation yet. Run a tracked simulation "
+                       "first -- the replay frames are produced by the run.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Track Animation", "particle_tracks.gif", "Animated GIF (*.gif)")
+        if not path:
+            return
+        if not path.lower().endswith('.gif'):
+            path += '.gif'
+        try:
+            from PIL import Image
+            images = [Image.open(f).convert('P', palette=Image.Palette.ADAPTIVE)
+                      for f in frames if os.path.exists(f)]
+            if not images:
+                raise ValueError("none of the frame files could be opened")
+            # The last frame is the complete picture, so it is held longer
+            # than the partial ones that build up to it.
+            durations = [270] * (len(images) - 1) + [1500]
+            images[0].save(path, save_all=True, append_images=images[1:],
+                           duration=durations, loop=0)
+        except Exception as e:
+            self._fail("Could Not Save Animation",
+                       f"{e}\n\nSaving a GIF needs Pillow (pip install Pillow).")
+            return
+        self._log(f"🎞 Track animation saved to {path} ({len(frames)} frames)")
+
+    def redraw_from_cache(self, *_args, replot_background=False):
         """Re-render the overlay from track data already in memory.
 
         None of the display settings affect the transport calculation, so
@@ -1377,6 +1697,8 @@ class TracksPageWidget(QWidget):
             # moved on so the result is refreshed once it lands, rather
             # than queueing a thread per keystroke.
             self._redraw_pending = True
+            self._redraw_pending_replot = (
+                getattr(self, '_redraw_pending_replot', False) or replot_background)
             return
 
         # Stop the replay animation: it would otherwise overwrite the new
@@ -1384,12 +1706,21 @@ class TracksPageWidget(QWidget):
         if getattr(self, '_anim_timer', None) is not None:
             self._anim_timer.stop()
 
+        origin = self.render_origin() or cache['origin']
+        replot = None
+        if replot_background and cache.get('track_dir'):
+            replot = {'track_dir': cache['track_dir'],
+                      'pixels': cache['pixels'],
+                      'color_by': cache['color_by']}
+
         self._redraw_pending = False
+        self._redraw_pending_replot = False
         self.progress_bar.setVisible(True)
         out_path = os.path.join(os.path.dirname(cache['geometry_png']), "tracks_redraw.png")
         self._redraw_worker = TrackRedrawWorker(
             cache['tracks'], cache['geometry_png'], cache['basis'],
-            cache['origin'], cache['width'], out_path, self.display_options())
+            origin, cache['width'], out_path, self.display_options(),
+            model_bbox=cache.get('model_bbox'), replot=replot)
         self._redraw_worker.finished_signal.connect(self._on_redraw_finished)
         self._redraw_worker.start()
 
@@ -1399,8 +1730,21 @@ class TracksPageWidget(QWidget):
             self._fail("Redraw Failed", message)
             return
         self.viewer.set_image(QPixmap(frame_path))
+        self._current_frame = frame_path
+
+        stats = getattr(self._redraw_worker, 'stats', {}) or {}
+        if stats.get('escaped') or stats.get('absorbed'):
+            total = stats['escaped'] + stats['absorbed']
+            if total:
+                self._log(f"🎯 Fate of {total} tracked particles: "
+                          f"{stats['absorbed']} absorbed, {stats['escaped']} escaped "
+                          f"({100.0 * stats['escaped'] / total:.1f}% got out).")
+
         if getattr(self, '_redraw_pending', False):
-            self.redraw_from_cache()   # settings changed while this ran
+            # Settings changed while this ran; carry any pending background
+            # re-plot into the follow-up rather than dropping it.
+            self.redraw_from_cache(
+                replot_background=getattr(self, '_redraw_pending_replot', False))
 
     def run_tracked_simulation(self):
         main_win = self.window()
@@ -1491,7 +1835,14 @@ class TracksPageWidget(QWidget):
                 'basis': worker.basis,
                 'origin': worker.origin,
                 'width': worker.width,
+                'pixels': worker.pixels,
+                'color_by': worker.color_by,
+                'track_dir': os.path.dirname(worker.geometry_png),
+                'model_bbox': worker.model_bbox,
             }
+            diag = diagnostics or {}
+            if diag.get('has_any_points'):
+                self._configure_slice_slider(diag['mins'], diag['maxs'])
 
         self._warn_if_nothing_visible(diagnostics or {})
 
@@ -1596,7 +1947,9 @@ class TracksPageWidget(QWidget):
         if self._anim_index >= len(self._anim_frames):
             self._anim_timer.stop()
             return
-        self.viewer.set_image(QPixmap(self._anim_frames[self._anim_index]))
+        frame = self._anim_frames[self._anim_index]
+        self.viewer.set_image(QPixmap(frame))
+        self._current_frame = frame   # what "Save Image" writes out
         self._anim_index += 1
 
     def append_track_code(self):
