@@ -15,10 +15,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 from PySide6.QtGui import QPixmap
 
+import matplotlib
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.collections import LineCollection
-from matplotlib.colors import to_rgba
+from matplotlib.colors import to_rgba, LogNorm, Normalize
+from matplotlib.cm import ScalarMappable
+from matplotlib.lines import Line2D
 import matplotlib.image as mpimg
 import matplotlib.patheffects as pe
 
@@ -259,24 +262,78 @@ def _discover_model_objects(script_code):
     return geometry, materials_list, settings_obj, tallies_obj, None
 
 
+def _contiguous_runs(mask):
+    """Yield (start, stop) index pairs for each maximal run of True.
+
+    Used by the slice filter: a track that leaves the slab and comes back
+    must be drawn as two separate polylines. Joining them would draw a
+    straight line across the gap that the particle never travelled.
+    """
+    if not mask.any():
+        return
+    edges = np.flatnonzero(np.diff(mask.astype(np.int8)))
+    starts = np.concatenate(([0], edges + 1))
+    stops = np.concatenate((edges + 1, [mask.size]))
+    for start, stop in zip(starts, stops):
+        if mask[start]:
+            yield int(start), int(stop)
+
+
+def _collision_indices(states, n_states):
+    """Indices of states that are real collisions rather than surface
+    crossings: a new state whose cell_id AND material_id both match the
+    previous state's did not cross into a new cell, and OpenMC only writes
+    a state on a real event."""
+    cell_ids = np.atleast_1d(states['cell_id'])[:n_states]
+    mat_ids = np.atleast_1d(states['material_id'])[:n_states]
+    if cell_ids.shape[0] <= 2:
+        return np.empty(0, dtype=int)
+    same_cell = (cell_ids[1:] == cell_ids[:-1]) & (mat_ids[1:] == mat_ids[:-1])
+    return np.flatnonzero(same_cell) + 1
+
+
 def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_path,
                      show_tracks=True, show_source=True, show_collisions=True,
-                     source_marker_size=7, reveal_fraction=1.0, reveal_time=None, dpi=150):
+                     source_marker_size=7, reveal_fraction=1.0, reveal_time=None, dpi=150,
+                     slab_thickness=None, color_mode='particle',
+                     collision_mode='points', collision_marker_size=5,
+                     show_primaries=True, show_secondaries=True, heatmap_bins=60):
     """Composite the background geometry PNG with real particle-track
-    polylines, source-birth markers, and interaction-point markers, all
-    aligned in PHYSICAL (cm) coordinates via matplotlib's `extent` -- this
-    sidesteps needing to hand-compute pixel offsets, and automatically
-    stays correct for any Basis/Origin/Width combination.
+    polylines, source-birth markers, and interaction points, all aligned in
+    PHYSICAL (cm) coordinates via matplotlib's `extent` -- this sidesteps
+    needing to hand-compute pixel offsets, and automatically stays correct
+    for any Basis/Origin/Width combination.
 
-    The four show_* flags are independent toggles (any combination,
-    including all four or just one), matching how the UI checkboxes work.
+    The show_* flags are independent toggles (any combination), matching
+    how the UI checkboxes work.
 
-    Track lines are colored by particle type (see PARTICLE_COLORS) but
-    drawn as a LineCollection whose per-segment ALPHA is driven by the
-    real recorded energy (states['E']) relative to that particle's own
-    starting energy -- full energy is fully opaque, and the line fades as
-    the particle loses energy along its path, so energy loss is visible
-    directly on the track itself.
+    `slab_thickness` (cm) restricts drawing to states within +/- half that
+    distance of the plane along the axis the basis does not cover. Without
+    it the whole depth of a 3D model is flattened onto one plane, so tracks
+    centimetres away from the background slice are drawn on top of it as
+    though they were in it -- the picture becomes denser than the physics
+    and stops matching the geometry underneath. None keeps the old
+    project-everything behaviour.
+
+    `color_mode`:
+      'particle' -- one colour per particle type (PARTICLE_COLORS), with
+                    per-segment alpha following the particle's own energy
+                    relative to its starting energy.
+      'energy'   -- segments coloured by absolute energy on a shared
+                    logarithmic scale with a colour bar, so energies are
+                    comparable between tracks rather than only within one.
+
+    `collision_mode`:
+      'points'  -- one marker per interaction.
+      'heatmap' -- a 2D histogram of interaction sites. With thousands of
+                   collisions the individual markers merge into noise;
+                   binned, the same data shows where interaction actually
+                   concentrates.
+
+    `show_primaries` / `show_secondaries` split source particles from the
+    secondaries they create (Compton electrons, fluorescence photons).
+    Secondaries usually outnumber primaries several times over, so being
+    able to drop them is often what makes a plot readable at all.
 
     `reveal_time`, when given (absolute seconds, matching states['time']),
     truncates each track to only the states recorded at or before that
@@ -289,12 +346,14 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
 
     `dpi` is exposed so animation frames (which don't need to be
     razor-sharp -- they're each on screen for a fraction of a second) can
-    be rendered cheaper than the final "kept" frame, reducing the total
-    CPU work of a multi-frame animated run.
+    be rendered cheaper than the final "kept" frame.
     """
     img = mpimg.imread(geometry_png_path)
 
     h_idx, v_idx = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}[basis]
+    # The axis the basis does NOT cover -- the slice normal. Indices are a
+    # permutation of {0,1,2}, so the missing one is whatever is left over.
+    n_idx = 3 - h_idx - v_idx
     h_center, v_center = origin[h_idx], origin[v_idx]
     h_half, v_half = width[0] / 2.0, width[1] / 2.0
     extent = (h_center - h_half, h_center + h_half, v_center - v_half, v_center + v_half)
@@ -310,118 +369,205 @@ def _render_overlay(geometry_png_path, tracks, basis, origin, width, out_png_pat
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
 
-    seen_particles = set()
-    if show_tracks or show_source or show_collisions:
-        for track in tracks:
-            for i, ptrack in enumerate(track.particle_tracks):
-                r = _xyz_field_to_array(ptrack.states['r'])  # always a plain (N, 3) float array now
-                # For animated playback: only reveal the states recorded
-                # up to a cutoff. Prefer real elapsed TIME (reveal_time)
-                # over array-index fraction whenever available -- see the
-                # docstring above. A single-state track is unaffected
-                # (nothing to truncate); always keep at least 1 state so
-                # it can still register.
-                if r.shape[0] > 1:
-                    if reveal_time is not None:
-                        times = np.atleast_1d(ptrack.states['time']).astype(float)
-                        n_keep = max(1, int(np.searchsorted(times, reveal_time, side='right')))
-                        r = r[:n_keep]
-                    elif reveal_fraction < 1.0:
-                        n_keep = max(1, int(np.ceil(r.shape[0] * reveal_fraction)))
-                        r = r[:n_keep]
-                pname = ptrack.particle.name.lower()
-                color = PARTICLE_COLORS.get(pname, '#888888')
-                label = pname.capitalize() if pname not in seen_particles else None
+    # \u2500\u2500 Pass 1: collect what will be drawn \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Gathering first means the energy colour scale and the interaction
+    # heatmap can both be built from the WHOLE displayed set. Normalising
+    # per-track instead would make two tracks with the same colour mean
+    # different energies, which is exactly what the old alpha fade did.
+    polylines = []       # (h, v, seg_energy, pname, is_primary)
+    single_points = []   # (h, v, pname)
+    source_points = []   # (h, v, pname)
+    collision_points = []  # (h, v, pname)
 
-                # A particle with only ONE recorded state -> r.shape[0]==1
-                # after the conversion above. Drawn as a small marker
-                # (when show_source is on) rather than silently dropped --
-                # itself diagnostic: only markers and no lines means
-                # particles are being absorbed at/near birth.
-                if r.shape[0] < 2:
-                    if show_source:
-                        seen_particles.add(pname)
-                        ax.plot(r[0, h_idx], r[0, v_idx], marker='x', color=color, markersize=8,
-                                markeredgewidth=2.0, alpha=0.95, zorder=5, label=label,
-                                path_effects=[pe.withStroke(linewidth=2.0, foreground='white')])
+    for track in tracks:
+        for i, ptrack in enumerate(track.particle_tracks):
+            is_primary = (i == 0)
+            if is_primary and not show_primaries:
+                continue
+            if not is_primary and not show_secondaries:
+                continue
+
+            r = _xyz_field_to_array(ptrack.states['r'])  # plain (N, 3) float array
+            # For animated playback: only reveal the states recorded up to
+            # a cutoff. Prefer real elapsed TIME over array-index fraction
+            # whenever available -- see the docstring. Always keep at least
+            # one state so the particle can still register.
+            if r.shape[0] > 1:
+                if reveal_time is not None:
+                    times = np.atleast_1d(ptrack.states['time']).astype(float)
+                    n_keep = max(1, int(np.searchsorted(times, reveal_time, side='right')))
+                    r = r[:n_keep]
+                elif reveal_fraction < 1.0:
+                    n_keep = max(1, int(np.ceil(r.shape[0] * reveal_fraction)))
+                    r = r[:n_keep]
+
+            pname = ptrack.particle.name.lower()
+            energies = np.atleast_1d(ptrack.states['E']).astype(float)[:r.shape[0]]
+
+            # Slice filter: keep only the states lying within the slab.
+            if slab_thickness is not None and slab_thickness > 0:
+                in_slab = np.abs(r[:, n_idx] - origin[n_idx]) <= (slab_thickness / 2.0)
+            else:
+                in_slab = np.ones(r.shape[0], dtype=bool)
+            if not in_slab.any():
+                continue
+
+            h_all, v_all = r[:, h_idx], r[:, v_idx]
+
+            if show_source and is_primary and in_slab[0]:
+                source_points.append((h_all[0], v_all[0], pname))
+
+            if show_collisions:
+                hit_idx = _collision_indices(ptrack.states, r.shape[0])
+                hit_idx = hit_idx[in_slab[hit_idx]]
+                for k in hit_idx:
+                    collision_points.append((h_all[k], v_all[k], pname))
+
+            if not show_tracks:
+                continue
+
+            # Each run of consecutive in-slab states is its own polyline;
+            # a run of one state has no segment to draw, so it becomes a
+            # point instead of being dropped silently.
+            for start, stop in _contiguous_runs(in_slab):
+                if stop - start < 2:
+                    single_points.append((h_all[start], v_all[start], pname))
                     continue
+                seg_e = (energies[start:stop - 1] + energies[start + 1:stop]) / 2.0
+                polylines.append((h_all[start:stop], v_all[start:stop],
+                                  seg_e, pname, is_primary))
 
-                h = r[:, h_idx]
-                v = r[:, v_idx]
+    # \u2500\u2500 Energy colour scale, shared across every drawn segment \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    energy_norm = None
+    if color_mode == 'energy' and polylines:
+        all_e = np.concatenate([p[2] for p in polylines])
+        positive = all_e[all_e > 0]
+        if positive.size:
+            e_lo, e_hi = float(positive.min()), float(positive.max())
+            # A colour bar needs a real range; a monoenergetic run would
+            # otherwise collapse to a single value LogNorm cannot map.
+            if e_hi <= e_lo * 1.001:
+                e_hi = e_lo * 10.0
+            energy_norm = LogNorm(vmin=e_lo, vmax=e_hi)
+    cmap = matplotlib.colormaps['viridis']
 
-                if show_tracks:
-                    seen_particles.add(pname)
-                    # Energy-loss gradient: alpha per segment follows this
-                    # particle's OWN energy relative to its starting
-                    # energy (states['E'], eV) -- full energy = opaque,
-                    # fully spent = faint. Falls back to a flat, fully
-                    # opaque line if no positive starting energy is
-                    # recorded (e.g. a build/version without E populated).
-                    energies = np.atleast_1d(ptrack.states['E']).astype(float)[:r.shape[0]]
-                    e0 = energies[0] if energies.size and energies[0] > 0 else 0.0
-                    if e0 > 0:
-                        frac = np.clip(energies / e0, 0.0, 1.0)
-                        seg_frac = (frac[:-1] + frac[1:]) / 2.0
-                        min_alpha = 0.35
-                        seg_alpha = min_alpha + (1.0 - min_alpha) * seg_frac
-                    else:
-                        seg_alpha = np.full(max(0, len(h) - 1), 0.95)
+    # \u2500\u2500 Pass 2: draw \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    seen_particles = set()
+    for h, v, seg_e, pname, is_primary in polylines:
+        seen_particles.add(pname)
+        points = np.stack([h, v], axis=1).reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
-                    points = np.stack([h, v], axis=1).reshape(-1, 1, 2)
-                    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-                    seg_colors = np.tile(np.array(to_rgba(color)), (len(segments), 1))
-                    seg_colors[:, 3] = seg_alpha
+        # Secondaries are drawn thinner and dashed so they stay visually
+        # subordinate to the source particles even when both are shown.
+        linewidth = 1.6 if is_primary else 1.0
+        linestyle = 'solid' if is_primary else (0, (3, 2))
 
-                    lc = LineCollection(
-                        segments, colors=seg_colors, linewidths=1.6, zorder=3, label=label,
-                        path_effects=[pe.Stroke(linewidth=2.6, foreground='white', alpha=0.6), pe.Normal()])
-                    ax.add_collection(lc)
+        if energy_norm is not None:
+            lc = LineCollection(segments, cmap=cmap, norm=energy_norm,
+                                linewidths=linewidth, linestyles=linestyle, zorder=3)
+            lc.set_array(np.clip(seg_e, energy_norm.vmin, energy_norm.vmax))
+        else:
+            color = PARTICLE_COLORS.get(pname, '#888888')
+            # Per-segment alpha follows this particle's OWN energy relative
+            # to its start: full energy opaque, fully spent faint.
+            e0 = seg_e[0] if seg_e.size and seg_e[0] > 0 else 0.0
+            if e0 > 0:
+                frac = np.clip(seg_e / e0, 0.0, 1.0)
+                seg_alpha = 0.35 + 0.65 * frac
+            else:
+                seg_alpha = np.full(len(segments), 0.95)
+            seg_colors = np.tile(np.array(to_rgba(color)), (len(segments), 1))
+            seg_colors[:, 3] = seg_alpha
+            lc = LineCollection(segments, colors=seg_colors, linewidths=linewidth,
+                                linestyles=linestyle, zorder=3,
+                                path_effects=[pe.Stroke(linewidth=linewidth + 1.0,
+                                                        foreground='white', alpha=0.6),
+                                              pe.Normal()])
+        ax.add_collection(lc)
 
-                # Source-birth marker: only the FIRST particle_track entry
-                # in a Track is the primary (source) particle; the rest
-                # are secondaries (e.g. Compton electrons) born
-                # mid-geometry. Small filled circle, not a star -- with
-                # ~20 source points clustered close together a star's
-                # 5-point spikes overlap into a messy blob; a circle
-                # stays a clean, compact mark at any density.
-                if show_source and i == 0:
-                    seen_particles.add(pname)
-                    ax.plot(h[0], v[0], marker='o', color=color, markersize=source_marker_size,
-                            markeredgecolor='black', markeredgewidth=0.7, zorder=5,
-                            label=label if not show_tracks else None,
-                            path_effects=[pe.withStroke(linewidth=1.8, foreground='white')])
+    # A particle with a single usable state has no line to draw. Marked
+    # with an x rather than dropped -- only markers and no lines is itself
+    # diagnostic: particles are being absorbed at or near birth.
+    for h, v, pname in single_points:
+        seen_particles.add(pname)
+        ax.plot(h, v, marker='x', color=PARTICLE_COLORS.get(pname, '#888888'),
+                markersize=8, markeredgewidth=2.0, alpha=0.95, zorder=5,
+                path_effects=[pe.withStroke(linewidth=2.0, foreground='white')])
 
-                # Interaction markers: a state is a real collision when its
-                # cell_id AND material_id both match the PREVIOUS state --
-                # meaning this new recorded state happened without crossing
-                # a surface into a different cell (see the module-level
-                # comment above for why that's a reliable, data-grounded
-                # test rather than a guessed angle threshold).
-                if show_collisions:
-                    cell_ids = np.atleast_1d(ptrack.states['cell_id'])[:r.shape[0]]
-                    mat_ids = np.atleast_1d(ptrack.states['material_id'])[:r.shape[0]]
-                    if cell_ids.shape[0] > 2:
-                        same_cell = (cell_ids[1:] == cell_ids[:-1]) & (mat_ids[1:] == mat_ids[:-1])
-                        hit_idx = np.where(same_cell)[0] + 1
-                        if len(hit_idx) > 0:
-                            ax.plot(h[hit_idx], v[hit_idx], '.', color=color,
-                                    markersize=5, alpha=0.95, zorder=4,
-                                    path_effects=[pe.withStroke(linewidth=1.5, foreground='white')])
+    # Source-birth markers: a small filled circle, not a star -- with many
+    # source points clustered together a star's spikes overlap into a blob.
+    for h, v, pname in source_points:
+        seen_particles.add(pname)
+        ax.plot(h, v, marker='o', color=PARTICLE_COLORS.get(pname, '#888888'),
+                markersize=source_marker_size, markeredgecolor='black',
+                markeredgewidth=0.7, zorder=6,
+                path_effects=[pe.withStroke(linewidth=1.8, foreground='white')])
 
-    if seen_particles:
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.85)
+    collision_mesh = None
+    if collision_points:
+        ch = np.array([c[0] for c in collision_points])
+        cv = np.array([c[1] for c in collision_points])
+        if collision_mode == 'heatmap':
+            counts, h_edges, v_edges = np.histogram2d(
+                ch, cv, bins=heatmap_bins,
+                range=[[extent[0], extent[1]], [extent[2], extent[3]]])
+            # Empty bins stay fully transparent so the geometry shows
+            # through everywhere nothing actually happened.
+            masked = np.ma.masked_less_equal(counts.T, 0)
+            collision_mesh = ax.pcolormesh(
+                h_edges, v_edges, masked, cmap='inferno', alpha=0.75,
+                zorder=4, shading='auto')
+        else:
+            for pname in sorted({c[2] for c in collision_points}):
+                sel = np.array([c[2] == pname for c in collision_points])
+                ax.plot(ch[sel], cv[sel], '.',
+                        color=PARTICLE_COLORS.get(pname, '#888888'),
+                        markersize=collision_marker_size, alpha=0.95, zorder=5,
+                        path_effects=[pe.withStroke(linewidth=1.5, foreground='white')])
+
+    # \u2500\u2500 Legend / colour bars \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    if energy_norm is not None:
+        bar = fig.colorbar(ScalarMappable(norm=energy_norm, cmap=cmap),
+                           ax=ax, fraction=0.046, pad=0.03)
+        bar.set_label('Particle energy [eV]', fontsize=9)
+    elif seen_particles:
+        handles = [Line2D([], [], color=PARTICLE_COLORS.get(p, '#888888'),
+                          linewidth=2.0, label=p.capitalize())
+                   for p in sorted(seen_particles)]
+        if show_primaries and show_secondaries and any(not p[4] for p in polylines):
+            handles.append(Line2D([], [], color='#444444', linewidth=1.0,
+                                  linestyle=(0, (3, 2)), label='Secondary'))
+        ax.legend(handles=handles, loc='upper right', fontsize=8, framealpha=0.85)
+
+    if collision_mesh is not None:
+        bar2 = fig.colorbar(collision_mesh, ax=ax, fraction=0.046, pad=0.03,
+                            location='left')
+        bar2.set_label('Interactions per bin', fontsize=9)
 
     axis_labels = {'xy': ('X [cm]', 'Y [cm]'), 'xz': ('X [cm]', 'Z [cm]'), 'yz': ('Y [cm]', 'Z [cm]')}
     xl, yl = axis_labels[basis]
     ax.set_xlabel(xl)
     ax.set_ylabel(yl)
+
     title_bits = []
     if show_source:
         title_bits.append("\u25cf source birth")
     if show_collisions:
-        title_bits.append("\u00b7 interaction")
+        title_bits.append("interaction heatmap" if collision_mode == 'heatmap'
+                          else "\u00b7 interaction")
+    if not show_secondaries:
+        title_bits.append("primaries only")
+    elif not show_primaries:
+        title_bits.append("secondaries only")
     suffix = (" -- " + ", ".join(title_bits)) if title_bits else ""
-    ax.set_title(f"Particle Tracks ({basis} slice){suffix}")
+
+    normal_axis = 'XYZ'[n_idx]
+    if slab_thickness is not None and slab_thickness > 0:
+        depth = (f"{normal_axis} = {origin[n_idx]:.2f} \u00b1 {slab_thickness / 2.0:.2f} cm")
+    else:
+        depth = f"all {normal_axis} projected"
+    ax.set_title(f"Particle Tracks ({basis} slice, {depth}){suffix}")
 
     fig.tight_layout()
     canvas.print_png(out_png_path)
@@ -470,8 +616,7 @@ class TrackSimulationWorker(QThread):
 
     def __init__(self, script_code, n_particles, particle_filter,
                  basis, origin, width, pixels, color_by, export_root,
-                 show_tracks=True, show_source=True, show_collisions=True,
-                 source_marker_size=7):
+                 display=None, **legacy_display):
         super().__init__()
         self.script_code = script_code
         self.n_particles = n_particles
@@ -482,10 +627,18 @@ class TrackSimulationWorker(QThread):
         self.pixels = pixels
         self.color_by = color_by
         self.export_root = export_root
-        self.show_tracks = show_tracks
-        self.show_source = show_source
-        self.show_collisions = show_collisions
-        self.source_marker_size = source_marker_size
+        # Every drawing choice travels as one dict so it can be handed
+        # straight to _render_overlay and, more importantly, reused later
+        # by the redraw path without the two falling out of step.
+        # legacy_display keeps the old show_tracks=... keyword form working.
+        self.display = dict(display or {})
+        self.display.update(legacy_display)
+
+        # Kept so the page can redraw from memory instead of re-running a
+        # whole transport calculation just to toggle a checkbox.
+        self.tracks = None
+        self.geometry_png = None
+        self.t_max = 0.0
 
     def run(self):
         try:
@@ -826,13 +979,17 @@ class TrackSimulationWorker(QThread):
                 frame_path = os.path.join(track_dir, f"tracks_frame_{frame_i:02d}.png")
                 _render_overlay(geometry_png, tracks, self.basis, self.origin,
                                  self.width, frame_path,
-                                 show_tracks=self.show_tracks, show_source=self.show_source,
-                                 show_collisions=self.show_collisions,
-                                 source_marker_size=self.source_marker_size,
                                  reveal_fraction=fraction,
                                  reveal_time=(t_max * fraction) if t_max > 0 else None,
-                                 dpi=150 if is_last else 80)
+                                 dpi=150 if is_last else 80,
+                                 **self.display)
                 frame_paths.append(frame_path)
+
+            # Retained so a display toggle can redraw straight from these
+            # instead of paying for another transport run.
+            self.tracks = tracks
+            self.geometry_png = geometry_png
+            self.t_max = t_max
 
             # Hand the raw numbers back too, so the page can tell apart
             # "nothing was tracked" from "everything was tracked but lies
@@ -853,6 +1010,43 @@ class TrackSimulationWorker(QThread):
         except Exception as e:
             msg = str(e).strip() or f"{type(e).__name__} (no message attached to the exception)"
             self.finished_signal.emit(False, msg, [], {})
+
+
+class TrackRedrawWorker(QThread):
+    """Re-renders the overlay from track data already in memory.
+
+    Changing how tracks are drawn used to mean re-running the whole
+    transport calculation, because rendering only ever happened inside
+    TrackSimulationWorker. Hiding the interaction dots therefore cost a
+    full OpenMC run -- for a result that was already sitting in memory and
+    would come back identical. The track data does not depend on any of
+    the display settings, so redrawing needs nothing but matplotlib.
+
+    Still a thread: several thousand polylines take long enough to render
+    that doing it on the GUI thread would visibly freeze the window.
+    """
+    finished_signal = Signal(bool, str, str)  # success, message, frame path
+
+    def __init__(self, tracks, geometry_png, basis, origin, width,
+                 out_path, display):
+        super().__init__()
+        self.tracks = tracks
+        self.geometry_png = geometry_png
+        self.basis = basis
+        self.origin = origin
+        self.width = width
+        self.out_path = out_path
+        self.display = dict(display)
+
+    def run(self):
+        try:
+            _render_overlay(self.geometry_png, self.tracks, self.basis,
+                            self.origin, self.width, self.out_path,
+                            dpi=150, **self.display)
+            self.finished_signal.emit(True, "", self.out_path)
+        except Exception as e:
+            msg = str(e).strip() or f"{type(e).__name__} (no message attached)"
+            self.finished_signal.emit(False, msg, "")
 
 
 class _RunningNoticeDialog(QDialog):
@@ -956,11 +1150,85 @@ class TracksPageWidget(QWidget):
         self.chk_collisions.setChecked(True)
         form.addRow("", self.chk_collisions)
 
+        # Primaries vs secondaries. A run of 1000 source particles produced
+        # 4103 tracks -- so three quarters of what is on screen is
+        # secondaries, and being able to drop them is often what makes the
+        # plot readable at all.
+        self.chk_primaries = QCheckBox("Primary (source) particles")
+        self.chk_primaries.setChecked(True)
+        self.chk_primaries.setToolTip(
+            "The particles emitted by the source itself.")
+        form.addRow("", self.chk_primaries)
+
+        self.chk_secondaries = QCheckBox("Secondary particles")
+        self.chk_secondaries.setChecked(True)
+        self.chk_secondaries.setToolTip(
+            "Particles created during transport -- Compton electrons,\n"
+            "fluorescence photons, and so on. Drawn thinner and dashed\n"
+            "so they stay visually subordinate to the primaries.")
+        form.addRow("", self.chk_secondaries)
+
         self.source_size_spin = QSpinBox()
         self.source_size_spin.setRange(2, 30)
         self.source_size_spin.setValue(7)
         self.source_size_spin.setToolTip("Marker size (points) for the source-birth circles.")
         form.addRow("Source Marker Size:", self.source_size_spin)
+
+        self.collision_size_spin = QSpinBox()
+        self.collision_size_spin.setRange(1, 20)
+        self.collision_size_spin.setValue(4)
+        self.collision_size_spin.setToolTip(
+            "Marker size (points) for interaction dots. Lower this before\n"
+            "hiding them entirely -- at 1-2 they read as texture on the\n"
+            "track rather than as clutter over the geometry.")
+        form.addRow("Interaction Dot Size:", self.collision_size_spin)
+
+        self.collision_mode_combo = QComboBox()
+        self.collision_mode_combo.addItems(["Points", "Density heatmap"])
+        self.collision_mode_combo.setToolTip(
+            "Points        -- one dot per interaction.\n"
+            "Density heatmap -- the same interactions binned into a 2D\n"
+            "                histogram. With thousands of collisions the\n"
+            "                individual dots merge into noise; binned,\n"
+            "                they show where interaction concentrates.")
+        form.addRow("Interactions As:", self.collision_mode_combo)
+
+        # Slice thickness. Without it the full depth of a 3D model is
+        # flattened onto one plane, so tracks centimetres away from the
+        # background slice are drawn on top of it as though they were in
+        # it -- denser than the physics, and not matching the geometry
+        # underneath.
+        self.slab_field = QLineEdit("")
+        self.slab_field.setPlaceholderText("blank = project all depth")
+        self.slab_field.setToolTip(
+            "Draw only the parts of a track lying within +/- half this\n"
+            "distance of the plane, along the axis the Basis does not\n"
+            "cover (z for xy, y for xz, x for yz).\n\n"
+            "Leave blank to keep projecting the entire depth onto the\n"
+            "plane -- convenient, but it shows tracks that are nowhere\n"
+            "near the geometry slice drawn underneath them.")
+        form.addRow("Slice Thickness (cm):", self.slab_field)
+
+        self.track_color_combo = QComboBox()
+        self.track_color_combo.addItems(["Particle type", "Energy (log scale)"])
+        self.track_color_combo.setToolTip(
+            "Particle type      -- one colour per particle; the line fades\n"
+            "                   as that particle loses its own energy.\n"
+            "Energy (log scale) -- absolute energy on a shared colour bar,\n"
+            "                   so energies are comparable BETWEEN tracks\n"
+            "                   and not only along one.")
+        form.addRow("Color Tracks By:", self.track_color_combo)
+
+        # Redrawing needs only matplotlib and data already in memory, so
+        # every one of these is instant -- no second transport run.
+        for widget in (self.chk_tracks, self.chk_source, self.chk_collisions,
+                       self.chk_primaries, self.chk_secondaries):
+            widget.toggled.connect(self.redraw_from_cache)
+        for widget in (self.source_size_spin, self.collision_size_spin):
+            widget.valueChanged.connect(self.redraw_from_cache)
+        for widget in (self.collision_mode_combo, self.track_color_combo):
+            widget.currentIndexChanged.connect(self.redraw_from_cache)
+        self.slab_field.editingFinished.connect(self.redraw_from_cache)
 
         self.btn_run = QPushButton("\U0001F3AF Run Tracked Simulation")
         self.btn_run.setStyleSheet(
@@ -1049,6 +1317,76 @@ class TracksPageWidget(QWidget):
             return None, None, None, f"Resolution must have 2 values, got {len(pixels)}."
         return origin, width, pixels, None
 
+    def display_options(self):
+        """Every drawing choice, in the exact keyword form _render_overlay
+        takes. One place to read the widgets means the initial render and
+        every later redraw cannot drift apart."""
+        slab_text = self.slab_field.text().strip()
+        slab = None
+        if slab_text:
+            try:
+                slab = float(slab_text)
+                if slab <= 0:
+                    slab = None
+            except ValueError:
+                slab = None  # _parse_fields reports bad numbers; ignore here
+        return {
+            'show_tracks': self.chk_tracks.isChecked(),
+            'show_source': self.chk_source.isChecked(),
+            'show_collisions': self.chk_collisions.isChecked(),
+            'show_primaries': self.chk_primaries.isChecked(),
+            'show_secondaries': self.chk_secondaries.isChecked(),
+            'source_marker_size': self.source_size_spin.value(),
+            'collision_marker_size': self.collision_size_spin.value(),
+            'collision_mode': ('heatmap'
+                               if self.collision_mode_combo.currentText().startswith("Density")
+                               else 'points'),
+            'color_mode': ('energy'
+                           if self.track_color_combo.currentText().startswith("Energy")
+                           else 'particle'),
+            'slab_thickness': slab,
+        }
+
+    def redraw_from_cache(self):
+        """Re-render the overlay from track data already in memory.
+
+        None of the display settings affect the transport calculation, so
+        changing one has no business re-running OpenMC. Silently does
+        nothing until a run has actually produced tracks.
+        """
+        cache = getattr(self, '_track_cache', None)
+        if not cache:
+            return
+        if getattr(self, '_redraw_worker', None) is not None and self._redraw_worker.isRunning():
+            # A redraw is already in flight. Remember that the settings
+            # moved on so the result is refreshed once it lands, rather
+            # than queueing a thread per keystroke.
+            self._redraw_pending = True
+            return
+
+        # Stop the replay animation: it would otherwise overwrite the new
+        # image a few hundred milliseconds later with a stale frame.
+        if getattr(self, '_anim_timer', None) is not None:
+            self._anim_timer.stop()
+
+        self._redraw_pending = False
+        self.progress_bar.setVisible(True)
+        out_path = os.path.join(os.path.dirname(cache['geometry_png']), "tracks_redraw.png")
+        self._redraw_worker = TrackRedrawWorker(
+            cache['tracks'], cache['geometry_png'], cache['basis'],
+            cache['origin'], cache['width'], out_path, self.display_options())
+        self._redraw_worker.finished_signal.connect(self._on_redraw_finished)
+        self._redraw_worker.start()
+
+    def _on_redraw_finished(self, success, message, frame_path):
+        self.progress_bar.setVisible(False)
+        if not success:
+            self._fail("Redraw Failed", message)
+            return
+        self.viewer.set_image(QPixmap(frame_path))
+        if getattr(self, '_redraw_pending', False):
+            self.redraw_from_cache()   # settings changed while this ran
+
     def run_tracked_simulation(self):
         main_win = self.window()
         if not hasattr(main_win, 'script_editor'):
@@ -1086,11 +1424,7 @@ class TracksPageWidget(QWidget):
             code, self.n_particles_spin.value(), self.particle_filter_combo.currentText(),
             self.basis_combo.currentText(), origin, width, pixels,
             self.color_combo.currentText(), export_root,
-            show_tracks=self.chk_tracks.isChecked(),
-            show_source=self.chk_source.isChecked(),
-            show_collisions=self.chk_collisions.isChecked(),
-            source_marker_size=self.source_size_spin.value(),
-        )
+            display=self.display_options())
         self._worker.log_signal.connect(self._log)
         self._worker.finished_signal.connect(self._on_tracked_run_finished)
         self._worker.start()
@@ -1130,6 +1464,20 @@ class TracksPageWidget(QWidget):
             self._anim_timer = QTimer(self)
             self._anim_timer.timeout.connect(self._advance_animation_frame)
         self._anim_timer.start(270)  # ms per frame (6 frames now, was 12 at 180ms)
+
+        # Keep the track data so display toggles can redraw from it. The
+        # worker has finished by the time this runs, so reading its
+        # attributes here needs no extra synchronisation.
+        worker = getattr(self, '_worker', None)
+        if worker is not None and getattr(worker, 'tracks', None):
+            self._track_cache = {
+                'tracks': worker.tracks,
+                'geometry_png': worker.geometry_png,
+                'basis': worker.basis,
+                'origin': worker.origin,
+                'width': worker.width,
+            }
+
         self._warn_if_nothing_visible(diagnostics or {})
 
     def _warn_if_nothing_visible(self, diagnostics):
