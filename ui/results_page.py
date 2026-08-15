@@ -8,10 +8,11 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
-    QApplication, QDialog, QListWidget, QAbstractItemView
+    QApplication, QDialog, QListWidget, QAbstractItemView, QCheckBox
 )
 from PySide6.QtCore import Qt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -156,6 +157,10 @@ class ResultsPageWidget(QWidget):
         self._last_peaks = []
         self._depletion_data = {}
 
+        # Last plotted mesh, kept so it can be exported exactly as drawn --
+        # including the standard deviations, which a picture throws away.
+        self._last_mesh = None
+
         self._init_ui()
         self._setup_tally_plot_dialog()
         self._setup_hpge_dialog()
@@ -209,17 +214,83 @@ class ResultsPageWidget(QWidget):
         self.combo_mesh_score = QComboBox()
         combo_layout.addWidget(self.combo_mesh_score)
 
-        self.btn_plot_mesh = QPushButton("🗺️ Plot Mesh (Heatmap)")
-        self.btn_plot_mesh.setStyleSheet("background-color: #d97706; color: white; padding: 5px; font-weight: bold;")
-        self.btn_plot_mesh.clicked.connect(self.plot_mesh_tally)
-        combo_layout.addWidget(self.btn_plot_mesh)
-
         # --- Button to open independent plot window ---
         self.btn_open_plot_dialog = QPushButton("📈 Open Plot Window")
         self.btn_open_plot_dialog.setStyleSheet(
             "background-color: #0e639c; color: white; padding: 5px; font-weight: bold;")
         self.btn_open_plot_dialog.clicked.connect(self.open_tally_plot_window)
         combo_layout.addWidget(self.btn_open_plot_dialog)
+
+        # ── Mesh display options ──────────────────────────────────────────
+        mesh_row = QHBoxLayout()
+
+        mesh_row.addWidget(QLabel("Scale:"))
+        self.combo_mesh_scale = QComboBox()
+        self.combo_mesh_scale.addItems(["Log", "Linear"])
+        self.combo_mesh_scale.setToolTip(
+            "Log suits flux and dose, which fall by orders of magnitude across a\n"
+            "shield. Linear suits quantities with a narrow range.")
+        mesh_row.addWidget(self.combo_mesh_scale)
+
+        mesh_row.addWidget(QLabel("Style:"))
+        self.combo_mesh_style = QComboBox()
+        self.combo_mesh_style.addItems(["Heatmap", "Filled Contour", "Contour Lines"])
+        mesh_row.addWidget(self.combo_mesh_style)
+
+        mesh_row.addWidget(QLabel("Color:"))
+        self.combo_colormap = QComboBox()
+        # Perceptually uniform maps first, and they are the default. In a
+        # perceptually uniform map equal steps in the data look like equal
+        # steps in colour, so the eye reads gradients as they actually are.
+        # jet and rainbow are kept for compatibility with older reports but
+        # are marked, because their brightness rises and falls along the
+        # scale: they invent sharp bands where the data is smooth, flatten
+        # real detail elsewhere, are unreadable to red-green colour blind
+        # readers, and collapse in greyscale printing.
+        self.combo_colormap.addItems([
+            "viridis", "inferno", "magma", "plasma", "cividis", "turbo",
+            "coolwarm", "hot", "terrain", "jet (not recommended)",
+            "rainbow (not recommended)"])
+        self.combo_colormap.setToolTip(
+            "viridis / inferno / magma / plasma / cividis are perceptually\n"
+            "uniform: equal steps in the data look like equal steps in colour.\n"
+            "cividis also stays readable for colour-blind viewers.\n\n"
+            "jet and rainbow are not recommended: their brightness rises and\n"
+            "falls along the scale, so they show sharp bands where the data is\n"
+            "smooth and hide detail elsewhere.")
+        mesh_row.addWidget(self.combo_colormap)
+
+        self.chk_overlay_geom = QCheckBox("Overlay Geometry")
+        self.chk_overlay_geom.setChecked(True)
+        self.chk_overlay_geom.setToolTip(
+            "Draw the OpenMC geometry beneath the mesh result.")
+        mesh_row.addWidget(self.chk_overlay_geom)
+
+        self.chk_equal_aspect = QCheckBox("Equal Aspect")
+        self.chk_equal_aspect.setChecked(True)
+        self.chk_equal_aspect.setToolTip(
+            "Keep 1 cm on X the same length as 1 cm on Y, so circles stay\n"
+            "circular. Turning this off stretches the plot to fill the window\n"
+            "and distorts the geometry.")
+        mesh_row.addWidget(self.chk_equal_aspect)
+
+        mesh_row.addStretch()
+        tally_layout.addLayout(mesh_row)
+
+        mesh_btn_row = QHBoxLayout()
+        self.btn_plot_mesh = QPushButton("🗺️ Plot Mesh (2D/3D)")
+        self.btn_plot_mesh.setStyleSheet(
+            "background-color: #d97706; color: white; padding: 5px; font-weight: bold;")
+        self.btn_plot_mesh.clicked.connect(self.plot_mesh_tally)
+        mesh_btn_row.addWidget(self.btn_plot_mesh)
+
+        self.btn_export_mesh_matrix = QPushButton("📊 Export Mesh Data (OriginLab / Excel)")
+        self.btn_export_mesh_matrix.setStyleSheet(
+            "background-color: #8e44ad; color: white; padding: 5px; font-weight: bold;")
+        self.btn_export_mesh_matrix.clicked.connect(self.export_mesh_matrix)
+        mesh_btn_row.addWidget(self.btn_export_mesh_matrix)
+        mesh_btn_row.addStretch()
+        tally_layout.addLayout(mesh_btn_row)
 
         combo_layout.addStretch()
         tally_layout.addLayout(combo_layout)
@@ -1624,14 +1695,56 @@ class ResultsPageWidget(QWidget):
                 continue
             self.combo_mesh_score.addItem(score)
 
+    def _mesh_colormap(self):
+        """Colormap name, with the advisory suffix stripped."""
+        return self.combo_colormap.currentText().split(" (")[0]
+
+    def _overlay_geometry(self, ax, extent, lower_left, upper_right, h_axis, v_axis):
+        """Draw the geometry under the mesh, if it can be found."""
+        geom = None
+        # Not every StatePoint object exposes .summary (it depends on the
+        # OpenMC version and on whether summary.h5 was written), so it is
+        # probed rather than assumed -- an overlay is a nicety and must
+        # never be the reason the whole mesh plot fails.
+        summary = getattr(self.sp, 'summary', None)
+        if summary is not None and getattr(summary, 'geometry', None) is not None:
+            geom = summary.geometry
+        else:
+            try:
+                folder = os.path.dirname(getattr(self.sp, 'filepath', '') or '')
+                g_xml = os.path.join(folder, 'geometry.xml')
+                m_xml = os.path.join(folder, 'materials.xml')
+                if os.path.exists(g_xml) and os.path.exists(m_xml):
+                    mats = openmc.Materials.from_xml(m_xml)
+                    geom = openmc.Geometry.from_xml(g_xml, materials=mats)
+            except Exception as e:
+                self._log(f"⚠️ Geometry overlay: could not load XML fallback: {e}")
+
+        if geom is None:
+            self._log("⚠️ Geometry not found in the statepoint or its folder. Plotting mesh only.")
+            return
+
+        try:
+            flat_axis = [i for i in range(3) if i not in (h_axis, v_axis)][0]
+            origin = [0.0, 0.0, 0.0]
+            origin[h_axis] = (extent[0] + extent[1]) / 2.0
+            origin[v_axis] = (extent[2] + extent[3]) / 2.0
+            origin[flat_axis] = (lower_left[flat_axis] + upper_right[flat_axis]) / 2.0
+            width = (extent[1] - extent[0], extent[3] - extent[2])
+            basis = {(0, 1): 'xy', (0, 2): 'xz', (1, 2): 'yz'}.get((h_axis, v_axis), 'xy')
+            geom.root_universe.plot(origin=origin, width=width, pixels=(800, 800),
+                                    basis=basis, color_by='material', ax=ax)
+        except Exception as e:
+            self._log(f"⚠️ Geometry overlay rendering failed: {e}")
+
     def plot_mesh_tally(self):
         if not self.sp or not hasattr(self.sp, 'tallies') or not self.sp.tallies:
             QMessageBox.warning(self, "Warning", "Please load a StatePoint file with valid tallies first.")
             return
 
         tally_id = self.combo_tallies.currentData()
-        if tally_id is None:
-            QMessageBox.warning(self, "Warning", "Please select a valid Tally from the dropdown menu first.")
+        if tally_id is None or tally_id == -1:
+            QMessageBox.warning(self, "Warning", "Please select a valid Tally first.")
             return
 
         try:
@@ -1654,71 +1767,267 @@ class ResultsPageWidget(QWidget):
 
             tslice = tally.get_slice(scores=[score])
 
-            arr = None
-            reshape_is_verified = True
-            try:
-                arr = np.asarray(tslice.get_reshaped_data(value='mean'))
-                arr = np.squeeze(arr)
-            except AttributeError:
-                arr = None
+            def _shaped(value):
+                """Mesh-shaped array for 'mean' or 'std_dev', or None."""
+                try:
+                    out = np.squeeze(np.asarray(tslice.get_reshaped_data(value=value)))
+                    if out.ndim > 1:
+                        return out
+                except Exception:
+                    pass
+                raw = getattr(tslice, value, None)
+                if raw is None:
+                    return None      # std_dev in particular is optional
+                flat = np.asarray(raw, dtype=float).flatten()
+                if flat.size != np.prod(dims):
+                    return None
+                return flat.reshape(dims, order='F')
 
+            arr = _shaped('mean')
             if arr is None:
-                reshape_is_verified = False
-                arr = np.asarray(tslice.mean, dtype=float).flatten()
-                if arr.size != np.prod(dims):
-                    QMessageBox.critical(
-                        self, "Plot Error",
-                        f"Could not reshape tally data ({arr.size} values) to the mesh dimensions "
-                        f"{dims} ({np.prod(dims)} cells) -- the tally may combine the Mesh Filter "
-                        f"with another filter, which this simplified fallback can't separate. Use "
-                        f"'Export to CSV' and OpenMC's own get_pandas_dataframe() for exact cell mapping.")
-                    return
-                arr = arr.reshape(dims, order='F')
-                self._log("⚠️ Mesh reshape used a best-effort cell ordering (this OpenMC version has no "
-                          "get_reshaped_data) -- verify against 'Export to CSV' if exact spatial mapping matters.")
+                QMessageBox.critical(
+                    self, "Plot Error",
+                    f"Could not reshape tally data to the mesh dimensions {dims} -- the tally "
+                    f"may combine the Mesh Filter with another filter. Use 'Export to CSV' and "
+                    f"OpenMC's get_pandas_dataframe() for exact cell mapping.")
+                return
+            err = _shaped('std_dev')
 
             arr = np.squeeze(arr)
             non_unit_axes = [i for i, d in enumerate(dims) if d > 1]
 
+            is_log_scale = (self.combo_mesh_scale.currentText() == "Log")
+            mesh_style = self.combo_mesh_style.currentText()
+            cmap_choice = self._mesh_colormap()
+            overlay_geom = self.chk_overlay_geom.isChecked()
+
             fig, ax = plt.subplots(figsize=(8, 6))
 
             if arr.ndim <= 1 or len(non_unit_axes) <= 1:
+                # ── 1D ────────────────────────────────────────────────────
                 axis = non_unit_axes[0] if non_unit_axes else 0
                 n = dims[axis]
                 lo, hi = lower_left[axis], upper_right[axis]
                 centers = lo + (np.arange(n) + 0.5) * (hi - lo) / n
-                values_1d = arr.flatten()[:n]
+                values_1d = np.asarray(arr).flatten()[:n]
+                err_1d = np.asarray(err).flatten()[:n] if err is not None else None
                 axis_label = ['X', 'Y', 'Z'][axis]
-                ax.bar(centers, values_1d, width=(hi - lo) / n * 0.9, color='#d97706')
+
+                ax.bar(centers, values_1d, width=(hi - lo) / n * 0.9, color='#d97706',
+                       yerr=err_1d, ecolor='#7c2d12', capsize=2)
+                if is_log_scale:
+                    positive = values_1d[values_1d > 0]
+                    if positive.size:
+                        ax.set_yscale('log')
+                        ax.set_ylim(positive.min() * 0.5, values_1d.max() * 2.0)
+                    else:
+                        self._log("ℹ️ Log scale skipped: no positive values in this mesh.")
                 ax.set_xlabel(f'{axis_label} [cm]', fontweight='bold')
                 ax.set_ylabel(f'{score} [per source particle]')
                 ax.set_title(f'Mesh Tally {tally_id} -- {score} (1D, {axis_label}-axis)')
+                ax.grid(True, alpha=0.3)
+                self._last_mesh = None
             else:
+                # ── 2D / 3D ───────────────────────────────────────────────
                 if arr.ndim == 3:
                     plot_data = arr.sum(axis=2)
-                    title_suffix = ' (summed over Z -- 3D mesh projection)'
+                    err_data = (np.sqrt((np.asarray(err) ** 2).sum(axis=2))
+                                if err is not None and np.asarray(err).ndim == 3 else None)
+                    title_suffix = ' (summed over Z)'
                     h_axis, v_axis = 0, 1
                 else:
                     plot_data = arr
+                    err_data = np.asarray(err) if err is not None else None
                     title_suffix = ''
                     h_axis, v_axis = non_unit_axes[0], non_unit_axes[1]
 
                 extent = (lower_left[h_axis], upper_right[h_axis],
                           lower_left[v_axis], upper_right[v_axis])
-                im = ax.imshow(plot_data.T, origin='lower', extent=extent, aspect='auto', cmap='viridis')
-                fig.colorbar(im, ax=ax, label=f'{score} [per source particle]')
+
+                if overlay_geom:
+                    self._overlay_geometry(ax, extent, lower_left, upper_right, h_axis, v_axis)
+                alpha_val = 0.75 if overlay_geom else 1.0
+
+                nx, ny = plot_data.shape
+                x_edges = np.linspace(extent[0], extent[1], nx + 1)
+                y_edges = np.linspace(extent[2], extent[3], ny + 1)
+                X, Y = np.meshgrid((x_edges[:-1] + x_edges[1:]) / 2,
+                                   (y_edges[:-1] + y_edges[1:]) / 2)
+                Z = plot_data.T
+                S = err_data.T if err_data is not None else None
+
+                self._last_mesh = {
+                    'X': X, 'Y': Y, 'Z': Z, 'S': S, 'score': score,
+                    'tally_id': tally_id, 'extent': extent,
+                    'axis_names': (['X', 'Y', 'Z'][h_axis], ['X', 'Y', 'Z'][v_axis]),
+                    'log': is_log_scale,
+                }
+
+                # Cells with no score are EMPTY, not "very small". Substituting
+                # a floor such as 1e-12 used to hand LogNorm a vmin six decades
+                # below anything real, so the colour bar spanned 1e-12..1e-2
+                # and every actual value was squeezed into its top third --
+                # while the empty region was painted a solid colour that looked
+                # like data. Masking leaves those cells undrawn instead, so the
+                # colour range covers only measured values and the geometry
+                # shows through where nothing was scored.
+                positive = Z[np.isfinite(Z) & (Z > 0)]
+                cmap = plt.get_cmap(cmap_choice).copy()
+                cmap.set_bad(alpha=0.0)
+
+                if is_log_scale and positive.size == 0:
+                    self._log("ℹ️ Log scale skipped: this mesh has no positive values.")
+                    is_log_scale = False
+
+                if is_log_scale:
+                    Zm = np.ma.masked_less_equal(Z, 0.0)
+                    vmin, vmax = float(positive.min()), float(positive.max())
+                    if vmax <= vmin:
+                        vmax = vmin * 10.0
+                    norm = LogNorm(vmin=vmin, vmax=vmax)
+                    levels = np.logspace(np.log10(vmin), np.log10(vmax),
+                                         25 if mesh_style == "Filled Contour" else 12)
+                else:
+                    Zm = np.ma.masked_invalid(Z)
+                    norm = None
+                    finite = Z[np.isfinite(Z)]
+                    lo_v = float(finite.min()) if finite.size else 0.0
+                    hi_v = float(finite.max()) if finite.size else 1.0
+                    if hi_v <= lo_v:
+                        hi_v = lo_v + 1.0
+                    levels = np.linspace(lo_v, hi_v,
+                                         25 if mesh_style == "Filled Contour" else 12)
+
+                if mesh_style == "Heatmap":
+                    im = ax.imshow(Zm, origin='lower', extent=extent, cmap=cmap,
+                                   norm=norm, interpolation='nearest', alpha=alpha_val)
+                elif mesh_style == "Filled Contour":
+                    im = ax.contourf(X, Y, Zm, levels=levels, cmap=cmap, norm=norm,
+                                     alpha=alpha_val)
+                else:
+                    im = ax.contour(X, Y, Zm, levels=levels, cmap=cmap, norm=norm,
+                                    linewidths=1.5, alpha=alpha_val)
+
+                # Equal aspect keeps 1 cm on X the same length as 1 cm on Y.
+                # Without it a circular detector is drawn as an ellipse,
+                # because the axes box is stretched to fill the figure.
+                if self.chk_equal_aspect.isChecked():
+                    ax.set_aspect('equal', adjustable='box')
+                    ax.set_xlim(extent[0], extent[1])
+                    ax.set_ylim(extent[2], extent[3])
+
+                bar = fig.colorbar(im, ax=ax)
+                bar.set_label(f'{score} [per source particle]')
+
                 axis_labels = ['X', 'Y', 'Z']
                 ax.set_xlabel(f'{axis_labels[h_axis]} [cm]', fontweight='bold')
                 ax.set_ylabel(f'{axis_labels[v_axis]} [cm]', fontweight='bold')
                 ax.set_title(f'Mesh Tally {tally_id} -- {score}{title_suffix}')
 
+                # State the real span and how much of the mesh was empty --
+                # both were invisible before, and both change how the picture
+                # should be read.
+                n_empty = int(np.count_nonzero(~(np.isfinite(Z) & (Z > 0))))
+                if positive.size:
+                    self._log(f"✅ Mesh '{score}': {positive.min():.3e} to {positive.max():.3e} "
+                              f"({np.log10(positive.max() / positive.min()):.1f} decades), "
+                              f"{n_empty} of {Z.size} cells empty. "
+                              f"Scale: {'Log' if is_log_scale else 'Linear'}, cmap: {cmap_choice}.")
+                    if S is not None:
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            rel = np.where(Z > 0, S / Z, np.nan) * 100.0
+                        good = rel[np.isfinite(rel)]
+                        if good.size:
+                            noisy = int(np.count_nonzero(good > 10.0))
+                            self._log(f"   Statistical error: median {np.median(good):.1f}%, "
+                                      f"{noisy} cell(s) above 10% -- those are not yet converged.")
+
             fig.tight_layout()
             fig.show()
-            self._log(f"✅ Mesh tally plotted ({score}, dims={dims})."
-                      + ("" if reshape_is_verified else " Used best-effort reshape ordering."))
 
         except Exception as e:
             QMessageBox.critical(self, "Plot Error", f"Failed to plot mesh tally: {str(e)}")
+            self._log(f"⚠️ Mesh plot failed: {e}")
+
+    def export_mesh_matrix(self):
+        """Write the last plotted mesh out for OriginLab / Excel.
+
+        Two layouts, because the two tools want different things:
+
+          * Matrix -- a plain numeric grid, X positions along the header row
+            and Y positions down the first column. This is what OriginLab
+            imports directly as a Matrix, and re-plotting it reproduces the
+            picture exactly.
+          * XYZ -- one row per cell: X, Y, value, standard deviation and
+            relative error. Origin converts XYZ to a matrix, Excel pivots it,
+            and unlike the matrix layout it carries the uncertainties, which
+            the plot itself throws away.
+        """
+        mesh = getattr(self, '_last_mesh', None)
+        if not mesh:
+            QMessageBox.warning(
+                self, "Nothing to Export",
+                "Plot a 2D mesh tally first -- 'Plot Mesh (2D/3D)' stores the grid "
+                "that this button writes out.\n\n"
+                "A 1D mesh has no matrix to export; use 'Export to CSV' for that.")
+            return
+
+        matrix_filter = "OriginLab Matrix -- grid of values (*.csv)"
+        xyz_filter = "XYZ Table -- one row per cell, with errors (*.csv)"
+        default_name = f"Mesh_{mesh['score']}_Tally{mesh['tally_id']}.csv"
+        save_path, chosen = QFileDialog.getSaveFileName(
+            self, "Export Mesh Data", os.path.join(os.getcwd(), default_name),
+            f"{matrix_filter};;{xyz_filter}")
+        if not save_path:
+            return
+        if not save_path.lower().endswith('.csv'):
+            save_path += '.csv'
+
+        X, Y, Z, S = mesh['X'], mesh['Y'], mesh['Z'], mesh['S']
+        h_name, v_name = mesh['axis_names']
+
+        try:
+            if chosen == xyz_filter:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    rel = (np.where(Z > 0, (S / Z) * 100.0, np.nan)
+                           if S is not None else np.full(Z.shape, np.nan))
+                df = pd.DataFrame({
+                    f'{h_name} [cm]': X.ravel(),
+                    f'{v_name} [cm]': Y.ravel(),
+                    mesh['score']: np.asarray(Z).ravel(),
+                    'std_dev': (np.asarray(S).ravel() if S is not None
+                                else np.full(Z.size, np.nan)),
+                    'rel_err_percent': np.asarray(rel).ravel(),
+                })
+                df.to_csv(save_path, index=False)
+                extra = ("Columns: position, value, standard deviation and relative error.\n"
+                         "In OriginLab: Worksheet → Convert to Matrix → XYZ Gridding.")
+            else:
+                # Pure numeric grid: no comment lines, no units in the cells,
+                # so OriginLab reads it as a matrix without any cleanup.
+                df = pd.DataFrame(np.asarray(Z),
+                                  index=np.round(Y[:, 0], 6),
+                                  columns=np.round(X[0, :], 6))
+                df.index.name = f"{v_name}\\{h_name}"
+                df.to_csv(save_path)
+                extra = ("First row holds the X positions, first column the Y positions.\n"
+                         "In OriginLab: File → Import → CSV, then Plot → Contour / Image.")
+
+            self._log(f"✅ Mesh exported to {os.path.basename(save_path)} "
+                      f"({Z.shape[1]} x {Z.shape[0]} cells).")
+            QMessageBox.information(
+                self, "Export Complete",
+                f"{os.path.basename(save_path)}\n\n"
+                f"Grid: {Z.shape[1]} x {Z.shape[0]} cells\n"
+                f"Score: {mesh['score']}  (per source particle)\n"
+                f"Extent: {h_name} {mesh['extent'][0]:g} to {mesh['extent'][1]:g} cm, "
+                f"{v_name} {mesh['extent'][2]:g} to {mesh['extent'][3]:g} cm\n\n"
+                f"{extra}\n\n"
+                f"Empty cells are written as blanks, not as a small number, so a "
+                f"logarithmic plot in OriginLab keeps the same colour range as here.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export mesh: {e}")
+            self._log(f"⚠️ Mesh export failed: {e}")
 
     def _fit_peaks(self, energies_keV, counts, geb_abc, prominence_frac=0.5, window_factor=5.0):
         a, b, c = geb_abc
