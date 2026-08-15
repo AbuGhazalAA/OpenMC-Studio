@@ -291,6 +291,12 @@ class ExportWorker(QThread):
             export_path = os.path.join(self.project_dir, "export")
             if not os.path.exists(export_path):
                 os.makedirs(export_path)
+                summary_file = os.path.join(export_path, "summary.h5")
+                if os.path.exists(summary_file):
+                    try:
+                        os.remove(summary_file)
+                    except Exception:
+                        pass
 
             is_depletion_script = "openmc.deplete" in self.script_text
 
@@ -2004,41 +2010,53 @@ settings.source = openmc.IndependentSource(
             self.building_overlay.move(x, y)
 
     def _show_building_overlay(self):
-        if not hasattr(self, 'building_overlay'):
-            return
-        self.visual_tabs.setCurrentIndex(1)
-        QApplication.processEvents()
-        self.building_progress.setValue(0)
-        self.building_stage.setText("Preparing model...")
-        self._position_building_overlay()
-        self.building_overlay.raise_()
-        self.building_overlay.show()
-        self._position_building_overlay()
-        self.building_timer.start()
-        QApplication.processEvents()
+        try:
+            if not hasattr(self, 'building_overlay'):
+                return
+            self.visual_tabs.setCurrentIndex(1)
+            QApplication.processEvents()
+            self.building_progress.setValue(0)
+            self.building_stage.setText("Preparing model...")
+            self._position_building_overlay()
+            self.building_overlay.raise_()
+            self.building_overlay.show()
+            self._position_building_overlay()
+            self.building_timer.start()
+            QApplication.processEvents()
+        except RuntimeError:
+            pass  # تجاهل الخطأ في حال كانت الواجهة قد أُغلقت أو مُسحت من الذاكرة
 
     def _advance_building_progress(self):
-        if not hasattr(self, 'building_progress') or not self.building_overlay.isVisible():
-            return
-        value = self.building_progress.value()
-        if value < 88:
-            self.building_progress.setValue(value + 1)
+        try:
+            if not hasattr(self, 'building_progress') or not self.building_overlay.isVisible():
+                return
+            value = self.building_progress.value()
+            if value < 88:
+                self.building_progress.setValue(value + 1)
+        except RuntimeError:
+            pass  # تجاهل الخطأ
 
     def _set_building_stage(self, value, text):
-        if hasattr(self, 'building_progress'):
-            self.building_progress.setValue(max(0, min(100, value)))
-        if hasattr(self, 'building_stage'):
-            self.building_stage.setText(text)
-        QApplication.processEvents()
+        try:
+            if hasattr(self, 'building_progress'):
+                self.building_progress.setValue(max(0, min(100, value)))
+            if hasattr(self, 'building_stage'):
+                self.building_stage.setText(text)
+            QApplication.processEvents()
+        except RuntimeError:
+            pass  # تجاهل الخطأ
 
     def _hide_building_overlay(self):
-        if hasattr(self, 'building_timer'):
-            self.building_timer.stop()
-        if hasattr(self, 'building_overlay'):
-            self.building_overlay.hide()
-        if hasattr(self, 'plots_page'):
-            self.plots_page.setEnabled(True)
-        QApplication.processEvents()
+        try:
+            if hasattr(self, 'building_timer'):
+                self.building_timer.stop()
+            if hasattr(self, 'building_overlay'):
+                self.building_overlay.hide()
+            if hasattr(self, 'plots_page'):
+                self.plots_page.setEnabled(True)
+            QApplication.processEvents()
+        except RuntimeError:
+            pass  # تجاهل الخطأ في حال كانت الواجهة قد أُغلقت أو مُسحت من الذاكرة
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
