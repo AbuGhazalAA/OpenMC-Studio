@@ -8,7 +8,7 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, Normalize
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QGroupBox, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit,
@@ -205,8 +205,12 @@ class ResultsPageWidget(QWidget):
         self.combo_tallies.currentIndexChanged.connect(self.display_tally)
         combo_layout.addWidget(self.combo_tallies)
 
-        self.btn_export = QPushButton("💾 Export to CSV")
+        self.btn_export = QPushButton("💾 Export Table (CSV)")
         self.btn_export.setStyleSheet("background-color: #217346; color: white; padding: 5px; font-weight: bold;")
+        self.btn_export.setToolTip(
+            "Export the raw tally table shown below -- one row per filter bin,\n"
+            "exactly as OpenMC reports it. For the mesh grid itself use\n"
+            "'Export Mesh Grid' instead.")
         self.btn_export.clicked.connect(self.export_to_csv)
         combo_layout.addWidget(self.btn_export)
 
@@ -221,15 +225,22 @@ class ResultsPageWidget(QWidget):
         self.btn_open_plot_dialog.clicked.connect(self.open_tally_plot_window)
         combo_layout.addWidget(self.btn_open_plot_dialog)
 
+        tally_layout.addLayout(combo_layout)
+
         # ── Mesh display options ──────────────────────────────────────────
         mesh_row = QHBoxLayout()
 
         mesh_row.addWidget(QLabel("Scale:"))
         self.combo_mesh_scale = QComboBox()
-        self.combo_mesh_scale.addItems(["Log", "Linear"])
+        self.combo_mesh_scale.addItems(["Auto", "Log", "Linear"])
         self.combo_mesh_scale.setToolTip(
-            "Log suits flux and dose, which fall by orders of magnitude across a\n"
-            "shield. Linear suits quantities with a narrow range.")
+            "Auto   -- logarithmic when the values span more than two decades,\n"
+            "          which flux and dose almost always do, otherwise linear.\n"
+            "Log    -- always logarithmic.\n"
+            "Linear -- always linear. On data spanning decades this leaves\n"
+            "          everything but the peak at the bottom colour, so the\n"
+            "          range is clipped to the 1st-99th percentile to keep the\n"
+            "          plot readable; the colour bar states when that happens.")
         mesh_row.addWidget(self.combo_mesh_scale)
 
         mesh_row.addWidget(QLabel("Style:"))
@@ -284,16 +295,19 @@ class ResultsPageWidget(QWidget):
         self.btn_plot_mesh.clicked.connect(self.plot_mesh_tally)
         mesh_btn_row.addWidget(self.btn_plot_mesh)
 
-        self.btn_export_mesh_matrix = QPushButton("📊 Export Mesh Data (OriginLab / Excel)")
+        self.btn_export_mesh_matrix = QPushButton("📊 Export Mesh Grid (OriginLab / Excel)")
         self.btn_export_mesh_matrix.setStyleSheet(
             "background-color: #8e44ad; color: white; padding: 5px; font-weight: bold;")
+        self.btn_export_mesh_matrix.setToolTip(
+            "Export the plotted mesh as a 2D grid or an XYZ table, ready to\n"
+            "re-plot in OriginLab. Different from 'Export Table (CSV)', which\n"
+            "writes the raw per-bin listing.")
         self.btn_export_mesh_matrix.clicked.connect(self.export_mesh_matrix)
         mesh_btn_row.addWidget(self.btn_export_mesh_matrix)
         mesh_btn_row.addStretch()
         tally_layout.addLayout(mesh_btn_row)
 
         combo_layout.addStretch()
-        tally_layout.addLayout(combo_layout)
 
         # Raw data table
         self.table_tally = QTableWidget()
@@ -1796,7 +1810,9 @@ class ResultsPageWidget(QWidget):
             arr = np.squeeze(arr)
             non_unit_axes = [i for i, d in enumerate(dims) if d > 1]
 
-            is_log_scale = (self.combo_mesh_scale.currentText() == "Log")
+            scale_mode = self.combo_mesh_scale.currentText()
+            is_log_scale = (scale_mode == "Log")
+            scale_reason = scale_mode.lower()
             mesh_style = self.combo_mesh_style.currentText()
             cmap_choice = self._mesh_colormap()
             overlay_geom = self.chk_overlay_geom.isChecked()
@@ -1815,8 +1831,12 @@ class ResultsPageWidget(QWidget):
 
                 ax.bar(centers, values_1d, width=(hi - lo) / n * 0.9, color='#d97706',
                        yerr=err_1d, ecolor='#7c2d12', capsize=2)
+                positive_1d = values_1d[values_1d > 0]
+                if scale_mode == "Auto" and positive_1d.size and positive_1d.min() > 0:
+                    is_log_scale = bool(
+                        np.log10(positive_1d.max() / positive_1d.min()) > 2.0)
                 if is_log_scale:
-                    positive = values_1d[values_1d > 0]
+                    positive = positive_1d
                     if positive.size:
                         ax.set_yscale('log')
                         ax.set_ylim(positive.min() * 0.5, values_1d.max() * 2.0)
@@ -1875,12 +1895,33 @@ class ResultsPageWidget(QWidget):
                 cmap = plt.get_cmap(cmap_choice).copy()
                 cmap.set_bad(alpha=0.0)
 
+                # Auto decides instead of leaving the choice to be discovered
+                # by trial: flux and dose fall by orders of magnitude across a
+                # shield, and on a linear scale everything but the peak
+                # collapses into the bottom colour.
+                n_decades = (np.log10(positive.max() / positive.min())
+                             if positive.size and positive.min() > 0 else 0.0)
+                if scale_mode == "Auto":
+                    is_log_scale = bool(positive.size and n_decades > 2.0)
+                    scale_reason = (f"auto: log ({n_decades:.1f} decades of range)"
+                                    if is_log_scale else
+                                    f"auto: linear ({n_decades:.1f} decades of range)")
+                else:
+                    scale_reason = scale_mode.lower()
+
                 if is_log_scale and positive.size == 0:
                     self._log("ℹ️ Log scale skipped: this mesh has no positive values.")
                     is_log_scale = False
+                    scale_reason = "linear (no positive values)"
+
+                # Empty cells are masked in BOTH scales, not just the
+                # logarithmic one -- a cell with no score is absent, and
+                # painting it the bottom colour makes emptiness look like a
+                # measured minimum.
+                Zm = np.ma.masked_where(~(np.isfinite(Z) & (Z > 0)), Z)
+                clipped = False
 
                 if is_log_scale:
-                    Zm = np.ma.masked_less_equal(Z, 0.0)
                     vmin, vmax = float(positive.min()), float(positive.max())
                     if vmax <= vmin:
                         vmax = vmin * 10.0
@@ -1888,14 +1929,24 @@ class ResultsPageWidget(QWidget):
                     levels = np.logspace(np.log10(vmin), np.log10(vmax),
                                          25 if mesh_style == "Filled Contour" else 12)
                 else:
-                    Zm = np.ma.masked_invalid(Z)
-                    norm = None
-                    finite = Z[np.isfinite(Z)]
-                    lo_v = float(finite.min()) if finite.size else 0.0
-                    hi_v = float(finite.max()) if finite.size else 1.0
-                    if hi_v <= lo_v:
-                        hi_v = lo_v + 1.0
-                    levels = np.linspace(lo_v, hi_v,
+                    if positive.size:
+                        # A linear scale over decades of data puts everything
+                        # but the peak in the bottom colour, which is why a
+                        # linear plot of a flux looks like a single bright
+                        # dot. Clipping to the 1st-99th percentile keeps the
+                        # structure visible; the colour bar says so.
+                        vmin = float(np.percentile(positive, 1))
+                        vmax = float(np.percentile(positive, 99))
+                        clipped = bool(vmin > positive.min() or vmax < positive.max())
+                        if vmax <= vmin:
+                            vmin, vmax = float(positive.min()), float(positive.max())
+                            clipped = False
+                        if vmax <= vmin:
+                            vmax = vmin + 1.0
+                    else:
+                        vmin, vmax = 0.0, 1.0
+                    norm = Normalize(vmin=vmin, vmax=vmax)
+                    levels = np.linspace(vmin, vmax,
                                          25 if mesh_style == "Filled Contour" else 12)
 
                 if mesh_style == "Heatmap":
@@ -1916,13 +1967,27 @@ class ResultsPageWidget(QWidget):
                     ax.set_xlim(extent[0], extent[1])
                     ax.set_ylim(extent[2], extent[3])
 
-                bar = fig.colorbar(im, ax=ax)
-                bar.set_label(f'{score} [per source particle]')
+                # Explicit ticks and labels. Left to matplotlib, a colour bar
+                # built from a contour set with a LogNorm can come out with no
+                # numbers on it at all when the range does not straddle whole
+                # decades -- which is how a flux plot ends up with a colour
+                # strip that says nothing about the values it encodes.
+                if is_log_scale:
+                    tick_vals = np.logspace(np.log10(vmin), np.log10(vmax), 6)
+                else:
+                    tick_vals = np.linspace(vmin, vmax, 6)
+                bar = fig.colorbar(im, ax=ax, ticks=tick_vals)
+                bar.ax.set_yticklabels([f"{t:.2e}" for t in tick_vals])
+                bar_label = f'{score} [per source particle]'
+                if clipped:
+                    bar_label += '\n(linear, clipped to 1st-99th percentile)'
+                bar.set_label(bar_label)
 
                 axis_labels = ['X', 'Y', 'Z']
                 ax.set_xlabel(f'{axis_labels[h_axis]} [cm]', fontweight='bold')
                 ax.set_ylabel(f'{axis_labels[v_axis]} [cm]', fontweight='bold')
-                ax.set_title(f'Mesh Tally {tally_id} -- {score}{title_suffix}')
+                ax.set_title(f'Mesh Tally {tally_id} -- {score}{title_suffix}\n'
+                             f'{scale_reason}', fontsize=11)
 
                 # State the real span and how much of the mesh was empty --
                 # both were invisible before, and both change how the picture
@@ -1932,7 +1997,7 @@ class ResultsPageWidget(QWidget):
                     self._log(f"✅ Mesh '{score}': {positive.min():.3e} to {positive.max():.3e} "
                               f"({np.log10(positive.max() / positive.min()):.1f} decades), "
                               f"{n_empty} of {Z.size} cells empty. "
-                              f"Scale: {'Log' if is_log_scale else 'Linear'}, cmap: {cmap_choice}.")
+                              f"Scale: {scale_reason}, cmap: {cmap_choice}.")
                     if S is not None:
                         with np.errstate(divide='ignore', invalid='ignore'):
                             rel = np.where(Z > 0, S / Z, np.nan) * 100.0
