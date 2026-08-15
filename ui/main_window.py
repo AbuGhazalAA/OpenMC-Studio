@@ -291,12 +291,6 @@ class ExportWorker(QThread):
             export_path = os.path.join(self.project_dir, "export")
             if not os.path.exists(export_path):
                 os.makedirs(export_path)
-                summary_file = os.path.join(export_path, "summary.h5")
-                if os.path.exists(summary_file):
-                    try:
-                        os.remove(summary_file)
-                    except Exception:
-                        pass
 
             is_depletion_script = "openmc.deplete" in self.script_text
 
@@ -405,13 +399,47 @@ class SimulationWorker(QThread):
 class PlotWorker(QThread):
     finished_signal = Signal(bool, str, str)
 
-    def __init__(self, export_dir):
+    def __init__(self, export_dir, plot_settings=None):
         super().__init__()
         self.export_dir = export_dir
+        # Basis / Origin / Width / Resolution / Color By, as typed on the
+        # 2D Plot Configuration panel. Without these the worker just ran
+        # `openmc --plot` over whatever plots.xml the export happened to
+        # leave behind -- the auto-generated default -- so every setting on
+        # that panel was silently ignored by "Validate Geometry & Plot".
+        self.plot_settings = plot_settings
+
+    def _write_plots_xml(self):
+        """Write plots.xml from the panel's settings.
+
+        Returns an error string, or None on success. Building the Plot
+        through the openmc API (rather than writing XML by hand) means the
+        same validation the rest of the app relies on applies here too.
+        """
+        if not self.plot_settings:
+            return None      # keep whatever the export produced
+        try:
+            plot = openmc.Plot()
+            plot.filename = 'geometry_plot'
+            plot.basis = self.plot_settings['basis']
+            plot.origin = self.plot_settings['origin']
+            plot.width = self.plot_settings['width']
+            plot.pixels = self.plot_settings['pixels']
+            plot.color_by = self.plot_settings['color_by']
+            openmc.Plots([plot]).export_to_xml(
+                os.path.join(self.export_dir, "plots.xml"))
+            return None
+        except Exception as e:
+            return f"Could not apply the plot settings: {e}"
 
     def run(self):
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+            settings_error = self._write_plots_xml()
+            if settings_error:
+                self.finished_signal.emit(False, settings_error, "")
+                return
 
             ppm_path = os.path.join(self.export_dir, "geometry_plot.ppm")
             png_path = os.path.join(self.export_dir, "geometry_plot.png")
@@ -2010,58 +2038,79 @@ settings.source = openmc.IndependentSource(
             self.building_overlay.move(x, y)
 
     def _show_building_overlay(self):
-        try:
-            if not hasattr(self, 'building_overlay'):
-                return
-            self.visual_tabs.setCurrentIndex(1)
-            QApplication.processEvents()
-            self.building_progress.setValue(0)
-            self.building_stage.setText("Preparing model...")
-            self._position_building_overlay()
-            self.building_overlay.raise_()
-            self.building_overlay.show()
-            self._position_building_overlay()
-            self.building_timer.start()
-            QApplication.processEvents()
-        except RuntimeError:
-            pass  # تجاهل الخطأ في حال كانت الواجهة قد أُغلقت أو مُسحت من الذاكرة
+        if not hasattr(self, 'building_overlay'):
+            return
+        self.visual_tabs.setCurrentIndex(1)
+        QApplication.processEvents()
+        self.building_progress.setValue(0)
+        self.building_stage.setText("Preparing model...")
+        self._position_building_overlay()
+        self.building_overlay.raise_()
+        self.building_overlay.show()
+        self._position_building_overlay()
+        self.building_timer.start()
+        QApplication.processEvents()
 
     def _advance_building_progress(self):
-        try:
-            if not hasattr(self, 'building_progress') or not self.building_overlay.isVisible():
-                return
-            value = self.building_progress.value()
-            if value < 88:
-                self.building_progress.setValue(value + 1)
-        except RuntimeError:
-            pass  # تجاهل الخطأ
+        if not hasattr(self, 'building_progress') or not self.building_overlay.isVisible():
+            return
+        value = self.building_progress.value()
+        if value < 88:
+            self.building_progress.setValue(value + 1)
 
     def _set_building_stage(self, value, text):
-        try:
-            if hasattr(self, 'building_progress'):
-                self.building_progress.setValue(max(0, min(100, value)))
-            if hasattr(self, 'building_stage'):
-                self.building_stage.setText(text)
-            QApplication.processEvents()
-        except RuntimeError:
-            pass  # تجاهل الخطأ
+        if hasattr(self, 'building_progress'):
+            self.building_progress.setValue(max(0, min(100, value)))
+        if hasattr(self, 'building_stage'):
+            self.building_stage.setText(text)
+        QApplication.processEvents()
 
     def _hide_building_overlay(self):
-        try:
-            if hasattr(self, 'building_timer'):
-                self.building_timer.stop()
-            if hasattr(self, 'building_overlay'):
-                self.building_overlay.hide()
-            if hasattr(self, 'plots_page'):
-                self.plots_page.setEnabled(True)
-            QApplication.processEvents()
-        except RuntimeError:
-            pass  # تجاهل الخطأ في حال كانت الواجهة قد أُغلقت أو مُسحت من الذاكرة
+        if hasattr(self, 'building_timer'):
+            self.building_timer.stop()
+        if hasattr(self, 'building_overlay'):
+            self.building_overlay.hide()
+        if hasattr(self, 'plots_page'):
+            self.plots_page.setEnabled(True)
+        QApplication.processEvents()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, 'building_overlay') and self.building_overlay.isVisible():
             self._position_building_overlay()
+
+    def _collect_plot_settings(self):
+        """Read the 2D Plot Configuration panel, or None if it cannot be read.
+
+        Returning None leaves the exported default in place rather than
+        failing the plot; a malformed entry is reported in the console so
+        the user learns why their value was not applied instead of watching
+        it be ignored.
+        """
+        page = getattr(self, 'plots_page', None)
+        if page is None:
+            return None
+        try:
+            origin = tuple(float(v) for v in page.origin_field.text().split(','))
+            width = tuple(float(v) for v in page.width_field.text().split(','))
+            pixels = tuple(int(v) for v in page.pixels_field.text().split(','))
+        except (AttributeError, ValueError):
+            self.console_widget.append_log(
+                "⚠️ Origin, Width or Resolution could not be read as numbers -- "
+                "plotting with the model's default view instead.")
+            return None
+        if len(origin) != 3 or len(width) != 2 or len(pixels) != 2:
+            self.console_widget.append_log(
+                "⚠️ Origin needs 3 values, Width and Resolution 2 each -- "
+                "plotting with the model's default view instead.")
+            return None
+        return {
+            'basis': page.basis_combo.currentText(),
+            'origin': origin,
+            'width': width,
+            'pixels': pixels,
+            'color_by': page.color_combo.currentText(),
+        }
 
     def _generate_and_show_plot(self):
         self._plot_request_id = getattr(self, '_plot_request_id', 0) + 1
@@ -2089,7 +2138,7 @@ settings.source = openmc.IndependentSource(
             QMessageBox.critical(self, "Export Error", message)
             return
         self._set_building_stage(55, "Generating geometry plot...")
-        plot_worker = PlotWorker(export_path)
+        plot_worker = PlotWorker(export_path, self._collect_plot_settings())
         self._active_workers.append(plot_worker)
         plot_worker.finished_signal.connect(
             lambda s, m, p, rid=request_id, w=plot_worker: self._on_plot_finished(s, m, p, rid, w))
