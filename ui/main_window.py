@@ -399,13 +399,47 @@ class SimulationWorker(QThread):
 class PlotWorker(QThread):
     finished_signal = Signal(bool, str, str)
 
-    def __init__(self, export_dir):
+    def __init__(self, export_dir, plot_settings=None):
         super().__init__()
         self.export_dir = export_dir
+        # Basis / Origin / Width / Resolution / Color By, as typed on the
+        # 2D Plot Configuration panel. Without these the worker just ran
+        # `openmc --plot` over whatever plots.xml the export happened to
+        # leave behind -- the auto-generated default -- so every setting on
+        # that panel was silently ignored by "Validate Geometry & Plot".
+        self.plot_settings = plot_settings
+
+    def _write_plots_xml(self):
+        """Write plots.xml from the panel's settings.
+
+        Returns an error string, or None on success. Building the Plot
+        through the openmc API (rather than writing XML by hand) means the
+        same validation the rest of the app relies on applies here too.
+        """
+        if not self.plot_settings:
+            return None      # keep whatever the export produced
+        try:
+            plot = openmc.Plot()
+            plot.filename = 'geometry_plot'
+            plot.basis = self.plot_settings['basis']
+            plot.origin = self.plot_settings['origin']
+            plot.width = self.plot_settings['width']
+            plot.pixels = self.plot_settings['pixels']
+            plot.color_by = self.plot_settings['color_by']
+            openmc.Plots([plot]).export_to_xml(
+                os.path.join(self.export_dir, "plots.xml"))
+            return None
+        except Exception as e:
+            return f"Could not apply the plot settings: {e}"
 
     def run(self):
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+            settings_error = self._write_plots_xml()
+            if settings_error:
+                self.finished_signal.emit(False, settings_error, "")
+                return
 
             ppm_path = os.path.join(self.export_dir, "geometry_plot.ppm")
             png_path = os.path.join(self.export_dir, "geometry_plot.png")
@@ -2045,6 +2079,39 @@ settings.source = openmc.IndependentSource(
         if hasattr(self, 'building_overlay') and self.building_overlay.isVisible():
             self._position_building_overlay()
 
+    def _collect_plot_settings(self):
+        """Read the 2D Plot Configuration panel, or None if it cannot be read.
+
+        Returning None leaves the exported default in place rather than
+        failing the plot; a malformed entry is reported in the console so
+        the user learns why their value was not applied instead of watching
+        it be ignored.
+        """
+        page = getattr(self, 'plots_page', None)
+        if page is None:
+            return None
+        try:
+            origin = tuple(float(v) for v in page.origin_field.text().split(','))
+            width = tuple(float(v) for v in page.width_field.text().split(','))
+            pixels = tuple(int(v) for v in page.pixels_field.text().split(','))
+        except (AttributeError, ValueError):
+            self.console_widget.append_log(
+                "⚠️ Origin, Width or Resolution could not be read as numbers -- "
+                "plotting with the model's default view instead.")
+            return None
+        if len(origin) != 3 or len(width) != 2 or len(pixels) != 2:
+            self.console_widget.append_log(
+                "⚠️ Origin needs 3 values, Width and Resolution 2 each -- "
+                "plotting with the model's default view instead.")
+            return None
+        return {
+            'basis': page.basis_combo.currentText(),
+            'origin': origin,
+            'width': width,
+            'pixels': pixels,
+            'color_by': page.color_combo.currentText(),
+        }
+
     def _generate_and_show_plot(self):
         self._plot_request_id = getattr(self, '_plot_request_id', 0) + 1
         request_id = self._plot_request_id
@@ -2071,7 +2138,7 @@ settings.source = openmc.IndependentSource(
             QMessageBox.critical(self, "Export Error", message)
             return
         self._set_building_stage(55, "Generating geometry plot...")
-        plot_worker = PlotWorker(export_path)
+        plot_worker = PlotWorker(export_path, self._collect_plot_settings())
         self._active_workers.append(plot_worker)
         plot_worker.finished_signal.connect(
             lambda s, m, p, rid=request_id, w=plot_worker: self._on_plot_finished(s, m, p, rid, w))
