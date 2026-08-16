@@ -18,31 +18,45 @@ class LoaderThread(QThread):
     خيط خلفي (Background Thread) لتحميل المكتبات الثقيلة.
     فصل هذه العملية يضمن عدم تجميد الواجهة (Main Thread)،
     مما يسمح لأزرار الإغلاق والتصغير بالعمل الفوري في أي لحظة.
+
+    Any failure is reported through load_failed rather than raised: an
+    exception here would abort run(), yet Qt still emits finished, so the
+    launch would go ahead as if nothing had happened and fail later with
+    no explanation of the real cause.
     """
     progress_update = Signal(int, str)
+    load_failed = Signal(str, str)      # module name, traceback
 
     def run(self):
-        # 1. تحميل الأساسيات
-        self.progress_update.emit(15, "Loading Base & Math Libraries...")
-        import numpy
-        import pandas
-        time.sleep(0.2)  # مهلة بسيطة لجمالية العرض
+        stage = "startup"
+        try:
+            # 1. تحميل الأساسيات
+            stage = "numpy / pandas"
+            self.progress_update.emit(15, "Loading Base & Math Libraries...")
+            import numpy
+            import pandas
+            time.sleep(0.2)  # مهلة بسيطة لجمالية العرض
 
-        # 2. تحميل SciPy (وهي ما كانت تسبب التأخير الأكبر)
-        self.progress_update.emit(35, "Initializing Data Analysis Engine (SciPy)...")
-        import scipy
-        import scipy.signal
-        import scipy.optimize
+            # 2. تحميل SciPy (وهي ما كانت تسبب التأخير الأكبر)
+            stage = "scipy"
+            self.progress_update.emit(35, "Initializing Data Analysis Engine (SciPy)...")
+            import scipy
+            import scipy.signal
+            import scipy.optimize
 
-        # 3. تحميل OpenMC
-        self.progress_update.emit(60, "Loading OpenMC Physics Engine... (Please wait)")
-        import openmc
+            # 3. تحميل OpenMC
+            stage = "openmc"
+            self.progress_update.emit(60, "Loading OpenMC Physics Engine... (Please wait)")
+            import openmc
 
-        # 4. بناء الواجهات
-        self.progress_update.emit(85, "Building User Interface Components...")
-        # بمجرد أن تنتهي هذه الخيوط من التحميل، ستكون المكتبات موجودة في (sys.modules)
-        # وعندما تستدعيها النافذة الرئيسية ستفتح في جزء من الثانية!
-        time.sleep(0.3)
+            # 4. بناء الواجهات
+            self.progress_update.emit(85, "Building User Interface Components...")
+            # بمجرد أن تنتهي هذه الخيوط من التحميل، ستكون المكتبات موجودة في (sys.modules)
+            # وعندما تستدعيها النافذة الرئيسية ستفتح في جزء من الثانية!
+            time.sleep(0.3)
+        except Exception:
+            import traceback
+            self.load_failed.emit(stage, traceback.format_exc())
 
 
 class SplashScreen(QWidget):
@@ -150,9 +164,14 @@ class SplashScreen(QWidget):
         main_layout.addSpacing(10)
 
         # --- ربط الخيط الخلفي ---
+        self._load_error = None
         self.loader_thread = LoaderThread()
         self.loader_thread.progress_update.connect(self.update_progress)
+        self.loader_thread.load_failed.connect(self._remember_load_error)
         self.loader_thread.finished.connect(self.launch_main_window)
+
+    def _remember_load_error(self, stage, details):
+        self._load_error = (stage, details)
 
     def close_app(self):
         """إغلاق البرنامج بشكل آمن إذا قرر المستخدم الإلغاء"""
@@ -170,12 +189,67 @@ class SplashScreen(QWidget):
         self.status.setText(text)
 
     def launch_main_window(self):
-        """استدعاء الواجهة الرئيسية بعد اكتمال تحميل المكتبات"""
+        """استدعاء الواجهة الرئيسية بعد اكتمال تحميل المكتبات
+
+        Everything here runs inside a Qt slot. An exception raised in a slot
+        does not propagate: Qt prints it to stderr and carries on. In a
+        windowed build there is no stderr, so a failure to build the main
+        window left the splash sitting at "Ready!" forever with no window
+        and no message -- the one failure mode that tells the user nothing
+        at all. Any error is now shown, with the traceback, instead.
+        """
         self.update_progress(100, "Ready!")
-        from ui.main_window import MainWindow
-        self.main_win = MainWindow()
-        self.main_win.show()
+
+        if self._load_error is not None:
+            stage, details = self._load_error
+            self._report_startup_failure(
+                f"A required library failed to load: {stage}", details)
+            return
+
+        try:
+            from ui.main_window import MainWindow
+            self.main_win = MainWindow()
+            self.main_win.show()
+        except Exception:
+            import traceback
+            self._report_startup_failure(
+                "The main window could not be created.", traceback.format_exc())
+            return
+
         self.close()  # إغلاق شاشة الترحيب
+
+    def _report_startup_failure(self, summary, details):
+        """Show why startup failed, with a traceback that can be copied."""
+        from PySide6.QtWidgets import QMessageBox
+
+        self.update_progress(100, "Startup failed")
+        self.status.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #c0392b; border: none;")
+
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("OpenMC Studio — Startup Failed")
+        box.setText(summary)
+        box.setInformativeText(
+            "The application cannot continue. The technical details below "
+            "name the missing piece — copy them when reporting this.")
+        box.setDetailedText(details)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # Also write it beside the executable: a dialog can be dismissed
+        # before it is read, and a packaged build has nowhere else to log.
+        try:
+            import os
+            base = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                    else os.path.dirname(os.path.abspath(__file__)))
+            with open(os.path.join(base, "startup_error.log"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(f"{summary}\n\n{details}")
+        except Exception:
+            pass
+
+        box.exec()
+        sys.exit(1)
 
 
 def main():
