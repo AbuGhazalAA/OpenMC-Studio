@@ -99,6 +99,22 @@ Each display layer (tracks, source points, interactions) can be toggled independ
 
 After a run completes, the latest statepoint file loads automatically. Tally results are available here for inspection, including spectrum visualization with GEB broadening applied for pulse-height tallies — so you can see a simulated detector spectrum the way it would actually appear on real instrumentation.
 
+#### Depletion / burnup runs
+
+When the run was a depletion calculation, the depletion results file (`depletion_results.h5`) is the one that loads — not the last per-step statepoint — and the **Depletion / Burnup Results Table** appears filled in, without any further clicks. It holds every step the file contains, whether the script asked for four timesteps or eighty:
+
+| Column | Meaning |
+| --- | --- |
+| Step | Index of the depletion step as stored in the file |
+| Time (days) | Cumulative irradiation time |
+| Burnup (MWd/kgHM = GWd/MTU) | Cumulative burnup — the two units are the same number. Shown as *Energy (MWd)* instead if the inventory contains no heavy metal to divide by |
+| k-effective, Std Dev (k) | Multiplication factor of each step and its statistical uncertainty |
+| Reactivity (pcm), Std Dev (pcm) | ρ = (k−1)/k × 10⁵ |
+
+Switching **View** to *Nuclide inventory* keeps the same rows and replaces the k-effective columns with one column per selected nuclide, in atoms, grams, weight %, atom density (a/b-cm) or N/N₀, for one material or all of them summed.
+
+Everything in the table is copyable: **📋 Copy Whole Table** puts it on the clipboard as tab-separated text that pastes into Excel or OriginLab as proper cells, **Ctrl+C** (or **📋 Copy Selection**) copies just the selected block, and **💾 Export This Table (CSV)** saves it at full numerical precision. The line above the table summarises what was extracted — number of steps, time and burnup range, how k moved, and the burnup at which k crosses 1.
+
 ---
 
 ## 5. Running a Simulation

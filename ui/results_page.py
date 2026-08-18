@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QListWidget, QAbstractItemView, QCheckBox
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -336,7 +337,129 @@ class ResultsPageWidget(QWidget):
 
         layout.addWidget(tally_group)
 
-        # --- 4. Spectral analysis window button (hidden by default) ---
+        # --- 4. Depletion / Burnup results table -------------------------
+        #
+        # A depletion run produces one row per timestep, and the number of
+        # steps is decided by the user's script -- four steps or eighty, days
+        # or burnup increments. Before, those numbers only reached the screen
+        # through the collapsed raw table (three columns, no burnup) or by
+        # exporting a file, so a burnup sweep looked as if it had produced
+        # nothing. This panel is filled and shown automatically the moment a
+        # depletion file is read, with every step the file contains, and is
+        # copyable straight into Excel / OriginLab.
+        self.dep_group = QGroupBox("🔥 Depletion / Burnup Results Table")
+        self.dep_group.setStyleSheet("font-weight: bold; font-size: 14px;")
+        dep_group_layout = QVBoxLayout(self.dep_group)
+
+        self.lbl_dep_summary = QLabel("No depletion results loaded.")
+        self.lbl_dep_summary.setStyleSheet(
+            "font-weight: normal; font-size: 12px; color: #444; padding: 2px;")
+        self.lbl_dep_summary.setWordWrap(True)
+        dep_group_layout.addWidget(self.lbl_dep_summary)
+
+        dep_ctrl_row = QHBoxLayout()
+        dep_ctrl_row.addWidget(QLabel("View:"))
+        self.combo_dep_table_view = QComboBox()
+        self.combo_dep_table_view.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_view.addItems(
+            ["k-effective & Burnup", "Nuclide inventory"])
+        self.combo_dep_table_view.setToolTip(
+            "k-effective & Burnup -- one row per depletion step: time, burnup,\n"
+            "                        k-effective, its standard deviation and\n"
+            "                        the reactivity in pcm.\n"
+            "Nuclide inventory    -- the same rows, with one column per\n"
+            "                        selected nuclide.")
+        self.combo_dep_table_view.currentIndexChanged.connect(
+            self._on_dep_table_view_changed)
+        dep_ctrl_row.addWidget(self.combo_dep_table_view)
+
+        self.btn_copy_dep_table = QPushButton("📋 Copy Whole Table")
+        self.btn_copy_dep_table.setStyleSheet(
+            "background-color: #217346; color: white; padding: 5px; font-weight: bold;")
+        self.btn_copy_dep_table.setToolTip(
+            "Copy every row -- headers included -- as tab-separated text,\n"
+            "ready to paste directly into Excel or OriginLab.\n"
+            "Ctrl+C inside the table copies just the selected cells.")
+        self.btn_copy_dep_table.clicked.connect(lambda *_: self._copy_depletion_table(False))
+        dep_ctrl_row.addWidget(self.btn_copy_dep_table)
+
+        self.btn_copy_dep_selection = QPushButton("📋 Copy Selection")
+        self.btn_copy_dep_selection.setStyleSheet("padding: 5px;")
+        self.btn_copy_dep_selection.setToolTip(
+            "Copy only the selected cells (same as Ctrl+C in the table).")
+        self.btn_copy_dep_selection.clicked.connect(lambda *_: self._copy_depletion_table(True))
+        dep_ctrl_row.addWidget(self.btn_copy_dep_selection)
+
+        self.btn_export_dep_table = QPushButton("💾 Export This Table (CSV)")
+        self.btn_export_dep_table.setStyleSheet(
+            "background-color: #0e639c; color: white; padding: 5px; font-weight: bold;")
+        self.btn_export_dep_table.setToolTip(
+            "Save exactly the table shown here, with full numerical precision.")
+        self.btn_export_dep_table.clicked.connect(self.export_depletion_table)
+        dep_ctrl_row.addWidget(self.btn_export_dep_table)
+
+        dep_ctrl_row.addStretch()
+        dep_group_layout.addLayout(dep_ctrl_row)
+
+        # Second row: only relevant to the inventory view, so it is hidden
+        # while the table shows k-effective.
+        self.dep_inv_controls = QWidget()
+        dep_inv_row = QHBoxLayout(self.dep_inv_controls)
+        dep_inv_row.setContentsMargins(0, 0, 0, 0)
+
+        dep_inv_row.addWidget(QLabel("Material:"))
+        self.combo_dep_table_mat = QComboBox()
+        self.combo_dep_table_mat.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_mat.setMinimumWidth(150)
+        self.combo_dep_table_mat.currentIndexChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.combo_dep_table_mat)
+
+        dep_inv_row.addWidget(QLabel("Units:"))
+        self.combo_dep_table_unit = QComboBox()
+        self.combo_dep_table_unit.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_unit.setMinimumWidth(180)
+        self.combo_dep_table_unit.addItems([
+            "Atoms", "Mass (g)", "Weight %", "Atom density (a/b-cm)", "Normalized N/N0"])
+        self.combo_dep_table_unit.currentIndexChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.combo_dep_table_unit)
+
+        dep_inv_row.addWidget(QLabel("Nuclides:"))
+        self.list_dep_table_nuclides = QListWidget()
+        self.list_dep_table_nuclides.setStyleSheet("font-weight: normal;")
+        self.list_dep_table_nuclides.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_dep_table_nuclides.setFixedHeight(72)
+        self.list_dep_table_nuclides.setMinimumWidth(220)
+        self.list_dep_table_nuclides.setToolTip(
+            "Hold Ctrl to add nuclides -- each one becomes a column of the table.")
+        self.list_dep_table_nuclides.itemSelectionChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.list_dep_table_nuclides)
+
+        dep_inv_row.addStretch()
+        dep_group_layout.addWidget(self.dep_inv_controls)
+        self.dep_inv_controls.setVisible(False)
+
+        self.table_depletion = QTableWidget()
+        self.table_depletion.setStyleSheet("font-weight: normal; font-size: 12px;")
+        self.table_depletion.setAlternatingRowColors(True)
+        self.table_depletion.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_depletion.setMinimumHeight(240)
+        self.table_depletion.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        dep_group_layout.addWidget(self.table_depletion)
+
+        # Ctrl+C on the table copies the selected block, the behaviour every
+        # spreadsheet user expects. Scoped to the widget so it never steals
+        # the shortcut from the rest of the page.
+        self._dep_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.table_depletion)
+        self._dep_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._dep_copy_shortcut.activated.connect(lambda *_: self._copy_depletion_table(True))
+
+        layout.addWidget(self.dep_group)
+        self.dep_group.setVisible(False)
+
+        # --- 5. Spectral analysis window button (hidden by default) ---
         self.btn_open_hpge = QPushButton("🚀 Open Advanced HPGe Spectral Analysis")
         self.btn_open_hpge.setStyleSheet(
             "background-color: #8e44ad; color: white; font-weight: bold; font-size: 15px; padding: 12px;")
@@ -610,6 +733,18 @@ class ResultsPageWidget(QWidget):
         print(msg)
 
     def auto_load_latest_statepoint(self):
+        """Open whatever the run just produced.
+
+        A depletion run writes one statepoint per timestep PLUS the single
+        depletion_results.h5 that holds the whole history. The statepoints
+        are created later than that file, so picking the newest by creation
+        time landed on the last step's statepoint: one k-effective, no
+        burnup table, and the depletion results appeared to have vanished.
+        The depletion file therefore wins whenever the run produced one,
+        and the comparison uses modification time -- the depletion file is
+        rewritten after every step, so it is the one that is genuinely most
+        recent.
+        """
         try:
             search_path_main = os.path.join(os.getcwd(), "*.h5")
             search_path_export = os.path.join(os.getcwd(), "export", "*.h5")
@@ -618,11 +753,46 @@ class ResultsPageWidget(QWidget):
             if not h5_files:
                 return
 
-            latest_file = max(h5_files, key=os.path.getctime)
+            latest_file = max(h5_files, key=os.path.getmtime)
+            latest_mtime = os.path.getmtime(latest_file)
+
+            # Depletion output of the same run: written no more than a few
+            # minutes before the last statepoint. An older one is left alone,
+            # so a stale file from a previous session cannot hijack the load.
+            dep_files = [p for p in h5_files
+                         if "depletion_results" in os.path.basename(p).lower()]
+            if not dep_files:
+                dep_files = [p for p in h5_files if self._is_depletion_file(p)]
+            dep_files = [p for p in dep_files
+                         if os.path.getmtime(p) >= latest_mtime - 600]
+
+            if dep_files:
+                latest_file = max(dep_files, key=os.path.getmtime)
+                self._log("🔥 Depletion results detected — loading the full burnup "
+                          f"history from {os.path.basename(latest_file)}.")
+
             self.lbl_file.setText(f"Auto-Loaded: {os.path.basename(latest_file)}")
             self.process_statepoint(latest_file)
         except Exception as e:
             self._log(f"⚠️ Auto-load failed: {e}")
+
+    @staticmethod
+    def _is_depletion_file(filepath):
+        """True for an openmc.deplete results file.
+
+        Decided by what the file contains -- the 'eigenvalues' and 'time'
+        datasets a depletion run writes -- not by its name. The default name
+        is depletion_results.h5, but a script that renames its output (or
+        keeps several cases side by side) still gets the burnup table
+        instead of a StatePoint read that would fail.
+        """
+        if "depletion_results" in os.path.basename(filepath).lower():
+            return True
+        try:
+            with h5py.File(filepath, 'r') as f:
+                return 'eigenvalues' in f and 'time' in f
+        except Exception:
+            return False
 
     def load_statepoint(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -682,7 +852,13 @@ class ResultsPageWidget(QWidget):
                     burnup_data = burnup_data[:min_len]
                 elif 'source_rate' in f:
                     try:
-                        power_W = np.array(f['source_rate']).flatten()
+                        # (results, stages): every stage of a predictor-
+                        # corrector step is run at that step's own power, so
+                        # the first stage is the power of the step. Flattening
+                        # instead interleaves the stages, which shifts every
+                        # burnup value after the first step.
+                        _sr = np.array(f['source_rate'], dtype=float)
+                        power_W = _sr[:, 0] if _sr.ndim == 2 and _sr.shape[1] else _sr.flatten()
                         power_MW = power_W / 1e6
                         if len(power_MW) > 0:
                             dt_days = np.diff(time_days)
@@ -857,12 +1033,38 @@ class ResultsPageWidget(QWidget):
                 self.tally_plot_dialog.combo_dep_mat.setEnabled(bool(materials))
                 self.tally_plot_dialog.combo_dep_mat.blockSignals(False)
 
+                # The same choices for the results table on the main page,
+                # which has its own selectors so it works without ever
+                # opening the plot window.
+                self.combo_dep_table_mat.blockSignals(True)
+                self.combo_dep_table_mat.clear()
+                self.combo_dep_table_mat.addItem("All materials (sum)", None)
+                for _m in materials:
+                    self.combo_dep_table_mat.addItem(f"Material {_m}", _m)
+                self.combo_dep_table_mat.setEnabled(bool(materials))
+                self.combo_dep_table_mat.blockSignals(False)
+
+                tlw = self.list_dep_table_nuclides
+                tlw.blockSignals(True)
+                tlw.clear()
+                tlw.addItems(ordered)
+                for _row in range(min(3, tlw.count())):
+                    tlw.item(_row).setSelected(True)
+                tlw.blockSignals(False)
+
                 if not nuclides:
                     self._log("ℹ️ No nuclide inventory found in this depletion file -- "
                               "only k-effective can be plotted.")
                 else:
                     self._log(f"✅ Depletion inventory loaded: {len(nuclides)} nuclide(s) "
                               f"across {len(materials)} material(s).")
+
+                # Show the results table straight away. A burnup run used to
+                # end with an empty-looking page unless the raw table was
+                # expanded by hand; now every step is on screen the moment
+                # the file is read, whatever the run length.
+                self.dep_group.setVisible(True)
+                self._populate_depletion_table()
 
                 # Plot data immediately and open window
                 self._plot_depletion_data()
@@ -1011,6 +1213,256 @@ class ResultsPageWidget(QWidget):
 
         return atoms, None
 
+    # ------------------------------------------------------------------
+    # Depletion results table
+    # ------------------------------------------------------------------
+    def _burnup_column_header(self):
+        """Header for the burnup column, honest about which quantity it is.
+
+        MWd/kgHM and GWd/MTU are the same number (1 MWd/kg = 1 GWd/tonne),
+        so both are named -- benchmark tables are usually quoted in the
+        second one. When no heavy metal was found in the inventory the
+        column holds the energy produced instead, and says so.
+        """
+        if getattr(self, '_x_is_energy', False):
+            return "Energy (MWd)"
+        return "Burnup (MWd/kgHM = GWd/MTU)"
+
+    def _format_inventory_value(self, value, unit):
+        """Inventory numbers span 20 decades (atoms) or sit near unity
+        (weight %, N/N0), so the format follows the unit rather than one
+        compromise that ruins both."""
+        if value is None or not np.isfinite(value):
+            return "n/a"
+        if unit in ("Weight %", "Normalized N/N0"):
+            return f"{value:.6f}"
+        return f"{value:.6E}"
+
+    def _build_depletion_table(self):
+        """Every row the loaded depletion file contains, ready to display.
+
+        Returns (headers, rows, columns, notes):
+            headers -- column titles
+            rows    -- list of lists of already-formatted strings
+            columns -- {title: numpy array} at full precision, for CSV export
+            notes   -- anything that had to be skipped, for the summary line
+
+        The number of rows is whatever the file holds: a four-step run and
+        an eighty-step burnup sweep are handled identically, because the
+        steps are read from the file and never assumed.
+        """
+        d = getattr(self, '_depletion_data', {}) or {}
+        if not d:
+            return [], [], {}, []
+
+        time_days = np.asarray(d.get('time_days', []), dtype=float)
+        k_val = np.asarray(d.get('k_val', []), dtype=float)
+        k_err = np.asarray(d.get('k_err', []), dtype=float)
+        burnup = d.get('burnup')
+        n_steps = len(time_days)
+        if n_steps == 0:
+            return [], [], {}, []
+
+        burnup_arr = np.asarray(burnup, dtype=float) if burnup is not None else None
+        notes = []
+
+        headers = ["Step", "Time (days)"]
+        columns = {"Step": np.arange(n_steps),
+                   "Time (days)": time_days}
+        if burnup_arr is not None:
+            b_header = self._burnup_column_header()
+            headers.append(b_header)
+            columns[b_header] = burnup_arr
+        else:
+            notes.append("no burnup/power data stored in this file")
+
+        view = self.combo_dep_table_view.currentText()
+
+        if view == "Nuclide inventory":
+            unit = self.combo_dep_table_unit.currentText()
+            mat_sel = self.combo_dep_table_mat.currentData()
+            selected = [i.text() for i in self.list_dep_table_nuclides.selectedItems()]
+            series = []
+            for nuc_name in selected:
+                values, reason = self._dep_series(nuc_name, unit, mat_sel)
+                if values is None:
+                    notes.append(f"{nuc_name} skipped ({reason})")
+                    continue
+                title = f"{nuc_name} [{unit}]"
+                headers.append(title)
+                arr = np.asarray(values, dtype=float)
+                columns[title] = arr
+                series.append((title, arr))
+            if not selected:
+                notes.append("select one or more nuclides to add their columns")
+        else:
+            unit = None
+            rho, rho_err = _reactivity_pcm(k_val, k_err)
+            series = []
+            for title, arr in (("k-effective", k_val),
+                               ("Std Dev (k)", k_err),
+                               ("Reactivity (pcm)", rho),
+                               ("Std Dev (pcm)", rho_err)):
+                headers.append(title)
+                columns[title] = arr
+                series.append((title, arr))
+
+        rows = []
+        for i in range(n_steps):
+            row = [str(i), f"{time_days[i]:.4f}"]
+            if burnup_arr is not None:
+                row.append(f"{burnup_arr[i]:.4f}" if i < len(burnup_arr) else "n/a")
+            for title, arr in series:
+                if i >= len(arr):
+                    row.append("n/a")
+                elif view == "Nuclide inventory":
+                    row.append(self._format_inventory_value(float(arr[i]), unit))
+                elif title.startswith("k-effective") or title.startswith("Std Dev (k)"):
+                    row.append(f"{arr[i]:.5f}")
+                else:
+                    row.append(f"{arr[i]:.1f}" if np.isfinite(arr[i]) else "n/a")
+            rows.append(row)
+
+        return headers, rows, columns, notes
+
+    def _populate_depletion_table(self):
+        """Fill and show the depletion table. Called automatically as soon
+        as a depletion file is loaded -- no button press needed."""
+        if not hasattr(self, 'table_depletion'):
+            return
+
+        headers, rows, columns, notes = self._build_depletion_table()
+        self._dep_table_columns = columns
+
+        self.table_depletion.setUpdatesEnabled(False)
+        self.table_depletion.clear()
+        self.table_depletion.setRowCount(len(rows))
+        self.table_depletion.setColumnCount(len(headers))
+        self.table_depletion.setHorizontalHeaderLabels(headers)
+
+        for r, row in enumerate(rows):
+            for c, text in enumerate(row):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if c > 0:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                                          Qt.AlignmentFlag.AlignVCenter)
+                self.table_depletion.setItem(r, c, item)
+        self.table_depletion.setUpdatesEnabled(True)
+
+        self.lbl_dep_summary.setText(self._depletion_summary_text(len(rows), notes))
+
+    def _depletion_summary_text(self, n_rows, notes):
+        """One line stating what was extracted, so the table can be trusted
+        without opening the file: how many steps, the range covered, and how
+        k moved across them."""
+        d = getattr(self, '_depletion_data', {}) or {}
+        if not d or n_rows == 0:
+            return "No depletion results loaded."
+
+        time_days = np.asarray(d.get('time_days', []), dtype=float)
+        k_val = np.asarray(d.get('k_val', []), dtype=float)
+        k_err = np.asarray(d.get('k_err', []), dtype=float)
+        burnup = d.get('burnup')
+
+        parts = [f"✅ {n_rows} depletion step(s) extracted automatically"]
+        if time_days.size:
+            parts.append(f"time {time_days[0]:.4g} → {time_days[-1]:.4g} d")
+        if burnup is not None and len(burnup):
+            b = np.asarray(burnup, dtype=float)
+            unit = "MWd" if getattr(self, '_x_is_energy', False) else "MWd/kgHM (= GWd/MTU)"
+            parts.append(f"burnup {b[0]:.4g} → {b[-1]:.4g} {unit}")
+        if k_val.size:
+            parts.append(f"k {k_val[0]:.5f} → {k_val[-1]:.5f}")
+            parts.append(f"final k = {k_val[-1]:.5f} ± {k_err[-1]:.5f}"
+                         if k_err.size else f"final k = {k_val[-1]:.5f}")
+            x_vals = (np.asarray(burnup, dtype=float)
+                      if (burnup is not None and len(burnup) == len(k_val))
+                      else time_days)
+            x_end, _ = _cycle_end(x_vals, k_val)
+            if x_end is not None:
+                unit = ("d" if x_vals is time_days
+                        else ("MWd" if getattr(self, '_x_is_energy', False) else "MWd/kgHM"))
+                parts.append(f"cycle end (k = 1) at {x_end:.4g} {unit}")
+        text = "  |  ".join(parts)
+        if notes:
+            text += "\n⚠️ " + "; ".join(notes)
+        return text
+
+    def _on_dep_table_view_changed(self):
+        """Nuclide/material/unit pickers only apply to the inventory view."""
+        is_inventory = self.combo_dep_table_view.currentText() == "Nuclide inventory"
+        self.dep_inv_controls.setVisible(is_inventory)
+        self._populate_depletion_table()
+
+    def _copy_depletion_table(self, selection_only=False):
+        """Put the table on the clipboard as tab-separated text -- the format
+        Excel, OriginLab and Google Sheets all paste as proper cells."""
+        if not hasattr(self, 'table_depletion') or self.table_depletion.rowCount() == 0:
+            QMessageBox.warning(self, "Nothing to Copy",
+                                "No depletion results are loaded yet.")
+            return
+
+        n_rows = self.table_depletion.rowCount()
+        n_cols = self.table_depletion.columnCount()
+
+        if selection_only:
+            ranges = self.table_depletion.selectedRanges()
+            if not ranges:
+                # Ctrl+C with nothing selected is a request for the table,
+                # not an error.
+                selection_only = False
+            else:
+                lines = []
+                for rng in ranges:
+                    header = [self.table_depletion.horizontalHeaderItem(c).text()
+                              for c in range(rng.leftColumn(), rng.rightColumn() + 1)]
+                    lines.append("\t".join(header))
+                    for r in range(rng.topRow(), rng.bottomRow() + 1):
+                        cells = []
+                        for c in range(rng.leftColumn(), rng.rightColumn() + 1):
+                            item = self.table_depletion.item(r, c)
+                            cells.append(item.text() if item else "")
+                        lines.append("\t".join(cells))
+                QApplication.clipboard().setText("\n".join(lines))
+                self._log(f"📋 Copied {sum(rng.rowCount() for rng in ranges)} selected "
+                          f"row(s) of the depletion table to the clipboard.")
+                return
+
+        lines = ["\t".join(self.table_depletion.horizontalHeaderItem(c).text()
+                           for c in range(n_cols))]
+        for r in range(n_rows):
+            cells = []
+            for c in range(n_cols):
+                item = self.table_depletion.item(r, c)
+                cells.append(item.text() if item else "")
+            lines.append("\t".join(cells))
+
+        QApplication.clipboard().setText("\n".join(lines))
+        self._log(f"📋 Depletion table copied to the clipboard "
+                  f"({n_rows} step(s), {n_cols} column(s)) — paste straight into Excel.")
+
+    def export_depletion_table(self):
+        """Save exactly the table on screen, at full precision rather than
+        the rounded strings that are displayed."""
+        columns = getattr(self, '_dep_table_columns', None)
+        if not columns:
+            QMessageBox.warning(self, "Warning", "No depletion results are loaded.")
+            return
+        try:
+            df = pd.DataFrame({k: pd.Series(v) for k, v in columns.items()})
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Depletion Table",
+                os.path.join(os.getcwd(), "Depletion_Table.csv"), "CSV Files (*.csv)")
+            if save_path:
+                df.to_csv(save_path, index=False)
+                self._log(f"✅ Depletion table exported ({len(df)} step(s), "
+                          f"{len(df.columns)} column(s)) → {os.path.basename(save_path)}")
+                QMessageBox.information(
+                    self, "Success", f"Depletion table saved to:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
     def _plot_depletion_data(self):
         """Plot depletion, burnup, and isotope data"""
         if not hasattr(self, '_depletion_data') or not self._depletion_data:
@@ -1141,9 +1593,18 @@ class ResultsPageWidget(QWidget):
                     pass
             self.sp = None
 
-            if "depletion_results" in os.path.basename(filepath).lower():
+            if self._is_depletion_file(filepath):
                 self._process_depletion_results(filepath)
                 return
+
+            # An ordinary statepoint carries no depletion history, so the
+            # table below would otherwise keep showing the previous run's.
+            if hasattr(self, 'dep_group'):
+                self.dep_group.setVisible(False)
+                self.table_depletion.setRowCount(0)
+                self.table_depletion.setColumnCount(0)
+                self._dep_table_columns = {}
+                self._depletion_data = {}
 
             self.sp = openmc.StatePoint(filepath)
             try:
