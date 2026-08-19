@@ -11,6 +11,28 @@ import numpy as np
 import multiprocessing
 from datetime import datetime
 
+def _script_interpreter():
+    """The Python that runs the generated OpenMC script.
+
+    sys.executable is the interpreter while the application runs from
+    source, but in a PyInstaller build it is OpenMC-Studio.exe itself --
+    handing the script to it would start a second copy of the interface
+    instead of running the model, with no error to explain why nothing
+    happened. When frozen, look for a real interpreter on PATH instead.
+
+    Returns None when none can be found, so the caller can say so plainly
+    rather than launching something that cannot work.
+    """
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    import shutil as _shutil
+    for name in ('python', 'python3', 'py'):
+        found = _shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 # Import the new combined Depletion and Burnup interface
 from ui.depletion_page import DepletionPageWidget
 from ui.burnup_page import DepletionBurnupWidget
@@ -295,8 +317,19 @@ class ExportWorker(QThread):
             is_depletion_script = "openmc.deplete" in self.script_text
 
             if not is_depletion_script:
+                interpreter = _script_interpreter()
+                if not interpreter:
+                    self.finished_signal.emit(
+                        False,
+                        "No Python interpreter was found to run the generated "
+                        "script.\n\nThis build of OpenMC Studio is a packaged "
+                        "executable, so it cannot run the model with itself. "
+                        "Install Python (with OpenMC available to it) and make "
+                        "sure 'python' is on the system PATH, then try again.",
+                        "", 0)
+                    return
                 result = subprocess.run(
-                    [sys.executable, script_path], cwd=export_path,
+                    [interpreter, script_path], cwd=export_path,
                     capture_output=True, text=True, encoding='utf-8', errors='replace'
                 )
                 if result.returncode != 0:
