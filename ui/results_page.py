@@ -67,6 +67,33 @@ def _split_nuclide_name(name):
     return m.group(1), int(m.group(2))
 
 
+_ATOMIC_MASS_CACHE = {}
+
+
+def _nuclide_molar_mass(name, mass_number):
+    """Molar mass of a nuclide in g/mol.
+
+    The mass number is only an approximation of the atomic mass -- U238 is
+    238.0508 g/mol, not 238 -- and it errs in the same direction for every
+    actinide. That is about -0.02% on the heavy-metal mass, and since burnup
+    is energy divided by that mass it pushes a 60.000 GWd/MTU end point to
+    60.013, which is exactly the kind of mismatch that makes a benchmark
+    table look wrong. openmc ships the measured masses, so they are used
+    when they can be reached, with the mass number left as the fallback for
+    an installation where they cannot.
+    """
+    if name in _ATOMIC_MASS_CACHE:
+        return _ATOMIC_MASS_CACHE[name]
+    value = float(mass_number) if mass_number else 0.0
+    try:
+        import openmc.data
+        value = float(openmc.data.atomic_mass(name))
+    except Exception:
+        pass
+    _ATOMIC_MASS_CACHE[name] = value
+    return value
+
+
 def _heavy_metal_mass_kg(atoms_row, nuc_index):
     """Initial heavy-metal mass in kg, computed straight from the atom
     inventory the depletion file already stores.
@@ -76,10 +103,10 @@ def _heavy_metal_mass_kg(atoms_row, nuc_index):
     Burnup is by definition referred to the INITIAL heavy metal mass, so
     this is meant to be called with the FIRST depletion step's row.
 
-    The mass number A is used in place of the exact atomic mass: for the
-    actinides that approximation is accurate to about 0.02% (U235 is
-    235.0439, U238 is 238.0508), which is far below the statistical
-    uncertainty of any Monte Carlo depletion run.
+    The measured atomic masses are used, falling back on the mass number
+    only when they cannot be read (see _nuclide_molar_mass): the difference
+    is 0.02%, small in itself but systematic, and it lands directly on the
+    burnup axis that benchmark tables are read off.
     """
     if atoms_row is None:
         return 0.0
@@ -87,7 +114,7 @@ def _heavy_metal_mass_kg(atoms_row, nuc_index):
     for name, idx in nuc_index.items():
         element, mass_number = _split_nuclide_name(name)
         if element in _HEAVY_METAL_Z and mass_number and idx < len(atoms_row):
-            grams += float(atoms_row[idx]) * mass_number / _AVOGADRO
+            grams += float(atoms_row[idx]) * _nuclide_molar_mass(name, mass_number) / _AVOGADRO
     return grams / 1000.0
 
 
@@ -950,8 +977,18 @@ class ResultsPageWidget(QWidget):
                 raise ValueError(
                     "Not a valid OpenMC depletion results file (missing 'eigenvalues' or 'time' datasets).")
 
-            # 1. Extract K-effective
+            # 1. K-effective -- ONE value per depletion step.
+            #
+            # /eigenvalues is (results, stages, 2). A predictor-corrector
+            # integrator (CECM, LEQI, EPC-RK4) runs TWO stages per step and
+            # stores a k for each, so flattening the array produced twice as
+            # many k values as there are steps and shifted every row: the
+            # burnup of step n was printed next to the corrector k of step
+            # n/2. openmc's own Results.get_keff() takes result.k[0], the
+            # first stage of each step, and that is what a benchmark table
+            # is quoted against -- so that is what is read here.
             k_data = np.array(f['eigenvalues'])
+            n_stages = 1
             if k_data.ndim == 1:
                 if k_data.dtype.names is not None:
                     k_val = k_data[k_data.dtype.names[0]]
@@ -959,18 +996,30 @@ class ResultsPageWidget(QWidget):
                 else:
                     k_val = k_data
                     k_err = np.zeros_like(k_val)
+            elif k_data.ndim >= 3:
+                n_stages = int(k_data.shape[1])
+                k_val = k_data[:, 0, 0]
+                k_err = k_data[:, 0, 1] if k_data.shape[2] >= 2 else np.zeros_like(k_val)
             else:
-                if k_data.shape[-1] >= 2:
-                    k_val = k_data[..., 0].flatten()
-                    k_err = k_data[..., 1].flatten()
-                else:
-                    k_val = k_data[..., 0].flatten()
-                    k_err = np.zeros_like(k_val)
+                k_val = k_data[:, 0]
+                k_err = k_data[:, 1] if k_data.shape[1] >= 2 else np.zeros_like(k_val)
+            k_val = np.asarray(k_val, dtype=float).ravel()
+            k_err = np.asarray(k_err, dtype=float).ravel()
 
-            # 2. Extract Time
-            time_data = np.array(f['time'])
+            # 2. Time -- the START time of each stored result.
+            #
+            # /time is (results, 2) = [start, end] of each result, and the
+            # final state is already stored as its own result, whose start
+            # and end are the same instant. Appending that end time again
+            # therefore invented an extra step at the bottom of the table,
+            # duplicating the last time with the next stage's k. The end
+            # time is only appended when it really is beyond the last start,
+            # i.e. when the file stops without storing the final state.
+            time_data = np.array(f['time'], dtype=float)
             if time_data.ndim == 2 and time_data.shape[1] == 2:
-                time_s = np.append(time_data[:, 0], time_data[-1, 1])
+                time_s = time_data[:, 0]
+                if not np.isclose(time_data[-1, 1], time_data[-1, 0]):
+                    time_s = np.append(time_s, time_data[-1, 1])
             else:
                 time_s = time_data.flatten()
             time_days = time_s / (24 * 60 * 60)
@@ -984,9 +1033,14 @@ class ResultsPageWidget(QWidget):
             burnup_data = None
             x_is_energy = False
             if 'burnup' in f:
-                b_data = np.array(f['burnup'])
+                b_data = np.array(f['burnup'], dtype=float)
                 if b_data.ndim > 1:
-                    burnup_data = b_data.sum(axis=1)
+                    # Same (results, stages) layout as the eigenvalues: the
+                    # stages of one step share a burnup, so adding them
+                    # would double it. Anything else is a per-material
+                    # breakdown, which does add up to the total.
+                    burnup_data = (b_data[:, 0] if b_data.shape[1] == n_stages
+                                   else b_data.sum(axis=1))
                 else:
                     burnup_data = b_data
                 burnup_data = burnup_data[:min_len]
@@ -1344,7 +1398,7 @@ class ResultsPageWidget(QWidget):
         if unit == "Mass (g)":
             if not mass_number:
                 return None, "mass number unknown"
-            return atoms * mass_number / _AVOGADRO, None
+            return atoms * _nuclide_molar_mass(nuc_name, mass_number) / _AVOGADRO, None
 
         if unit == "Weight %":
             if not mass_number:
@@ -1354,9 +1408,10 @@ class ResultsPageWidget(QWidget):
             for name, idx in nuc_index.items():
                 _e, a = _split_nuclide_name(name)
                 if a and idx < block.shape[1]:
-                    total += block[:, idx] * a
+                    total += block[:, idx] * _nuclide_molar_mass(name, a)
+            this_mass = _nuclide_molar_mass(nuc_name, mass_number)
             with np.errstate(divide='ignore', invalid='ignore'):
-                pct = np.where(total > 0, atoms * mass_number / total * 100.0, np.nan)
+                pct = np.where(total > 0, atoms * this_mass / total * 100.0, np.nan)
             return pct, None
 
         if unit == "Atom density (a/b-cm)":
