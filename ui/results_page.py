@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QListWidget, QAbstractItemView, QCheckBox
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -66,6 +67,33 @@ def _split_nuclide_name(name):
     return m.group(1), int(m.group(2))
 
 
+_ATOMIC_MASS_CACHE = {}
+
+
+def _nuclide_molar_mass(name, mass_number):
+    """Molar mass of a nuclide in g/mol.
+
+    The mass number is only an approximation of the atomic mass -- U238 is
+    238.0508 g/mol, not 238 -- and it errs in the same direction for every
+    actinide. That is about -0.02% on the heavy-metal mass, and since burnup
+    is energy divided by that mass it pushes a 60.000 GWd/MTU end point to
+    60.013, which is exactly the kind of mismatch that makes a benchmark
+    table look wrong. openmc ships the measured masses, so they are used
+    when they can be reached, with the mass number left as the fallback for
+    an installation where they cannot.
+    """
+    if name in _ATOMIC_MASS_CACHE:
+        return _ATOMIC_MASS_CACHE[name]
+    value = float(mass_number) if mass_number else 0.0
+    try:
+        import openmc.data
+        value = float(openmc.data.atomic_mass(name))
+    except Exception:
+        pass
+    _ATOMIC_MASS_CACHE[name] = value
+    return value
+
+
 def _heavy_metal_mass_kg(atoms_row, nuc_index):
     """Initial heavy-metal mass in kg, computed straight from the atom
     inventory the depletion file already stores.
@@ -75,10 +103,10 @@ def _heavy_metal_mass_kg(atoms_row, nuc_index):
     Burnup is by definition referred to the INITIAL heavy metal mass, so
     this is meant to be called with the FIRST depletion step's row.
 
-    The mass number A is used in place of the exact atomic mass: for the
-    actinides that approximation is accurate to about 0.02% (U235 is
-    235.0439, U238 is 238.0508), which is far below the statistical
-    uncertainty of any Monte Carlo depletion run.
+    The measured atomic masses are used, falling back on the mass number
+    only when they cannot be read (see _nuclide_molar_mass): the difference
+    is 0.02%, small in itself but systematic, and it lands directly on the
+    burnup axis that benchmark tables are read off.
     """
     if atoms_row is None:
         return 0.0
@@ -86,7 +114,7 @@ def _heavy_metal_mass_kg(atoms_row, nuc_index):
     for name, idx in nuc_index.items():
         element, mass_number = _split_nuclide_name(name)
         if element in _HEAVY_METAL_Z and mass_number and idx < len(atoms_row):
-            grams += float(atoms_row[idx]) * mass_number / _AVOGADRO
+            grams += float(atoms_row[idx]) * _nuclide_molar_mass(name, mass_number) / _AVOGADRO
     return grams / 1000.0
 
 
@@ -181,6 +209,32 @@ class ResultsPageWidget(QWidget):
         load_layout.addWidget(self.btn_load)
         load_layout.addWidget(self.lbl_file)
         load_layout.addStretch()
+
+        # A run leaves several .h5 files side by side -- depletion_results.h5
+        # plus one statepoint per depletion step, and often earlier cases as
+        # well. Only one of them can be displayed at a time, so they are all
+        # listed here and any of them is one click away, instead of going
+        # through the file dialog to reach the case that was not auto-loaded.
+        load_layout.addWidget(QLabel("Results file:"))
+        self.combo_result_files = QComboBox()
+        self.combo_result_files.setMinimumWidth(300)
+        self.combo_result_files.setStyleSheet("font-weight: normal;")
+        self.combo_result_files.setToolTip(
+            "Every OpenMC result file found in the working folder and its\n"
+            "export/ sub-folder. 🔥 marks a depletion file (the whole burnup\n"
+            "history in one file); 📊 marks an ordinary statepoint (a single\n"
+            "step or a single run).")
+        # 'activated' fires only on a real user choice, so re-selecting the
+        # file that was just loaded programmatically cannot re-trigger a load.
+        self.combo_result_files.activated.connect(self._on_result_file_chosen)
+        load_layout.addWidget(self.combo_result_files)
+
+        self.btn_rescan_files = QPushButton("🔄")
+        self.btn_rescan_files.setToolTip("Rescan the folder for result files.")
+        self.btn_rescan_files.setFixedWidth(36)
+        self.btn_rescan_files.clicked.connect(lambda *_: self._refresh_result_file_combo())
+        load_layout.addWidget(self.btn_rescan_files)
+
         layout.addLayout(load_layout)
 
         # --- 2. K-Effective Section ---
@@ -336,7 +390,146 @@ class ResultsPageWidget(QWidget):
 
         layout.addWidget(tally_group)
 
-        # --- 4. Spectral analysis window button (hidden by default) ---
+        # --- 4. Depletion / Burnup results table -------------------------
+        #
+        # A depletion run produces one row per timestep, and the number of
+        # steps is decided by the user's script -- four steps or eighty, days
+        # or burnup increments. Before, those numbers only reached the screen
+        # through the collapsed raw table (three columns, no burnup) or by
+        # exporting a file, so a burnup sweep looked as if it had produced
+        # nothing. This panel is filled and shown automatically the moment a
+        # depletion file is read, with every step the file contains, and is
+        # copyable straight into Excel / OriginLab.
+        self.dep_group = QGroupBox("🔥 Depletion / Burnup Results Table")
+        self.dep_group.setStyleSheet("font-weight: bold; font-size: 14px;")
+        dep_group_layout = QVBoxLayout(self.dep_group)
+
+        self.lbl_dep_summary = QLabel("No depletion results loaded.")
+        self.lbl_dep_summary.setStyleSheet(
+            "font-weight: normal; font-size: 12px; color: #444; padding: 2px;")
+        self.lbl_dep_summary.setWordWrap(True)
+        dep_group_layout.addWidget(self.lbl_dep_summary)
+
+        dep_ctrl_row = QHBoxLayout()
+        dep_ctrl_row.addWidget(QLabel("View:"))
+        self.combo_dep_table_view = QComboBox()
+        self.combo_dep_table_view.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_view.addItems(
+            ["k-effective & Burnup", "Nuclide inventory"])
+        self.combo_dep_table_view.setToolTip(
+            "k-effective & Burnup -- one row per depletion step: time, burnup,\n"
+            "                        k-effective, its standard deviation and\n"
+            "                        the reactivity in pcm.\n"
+            "Nuclide inventory    -- the same rows, with one column per\n"
+            "                        selected nuclide.")
+        self.combo_dep_table_view.currentIndexChanged.connect(
+            self._on_dep_table_view_changed)
+        dep_ctrl_row.addWidget(self.combo_dep_table_view)
+
+        self.btn_copy_dep_table = QPushButton("📋 Copy Whole Table")
+        self.btn_copy_dep_table.setStyleSheet(
+            "background-color: #217346; color: white; padding: 5px; font-weight: bold;")
+        self.btn_copy_dep_table.setToolTip(
+            "Copy every row -- headers included -- as tab-separated text,\n"
+            "ready to paste directly into Excel or OriginLab.\n"
+            "Ctrl+C inside the table copies just the selected cells.")
+        self.btn_copy_dep_table.clicked.connect(lambda *_: self._copy_depletion_table(False))
+        dep_ctrl_row.addWidget(self.btn_copy_dep_table)
+
+        self.btn_copy_dep_selection = QPushButton("📋 Copy Selection")
+        self.btn_copy_dep_selection.setStyleSheet("padding: 5px;")
+        self.btn_copy_dep_selection.setToolTip(
+            "Copy only the selected cells (same as Ctrl+C in the table).")
+        self.btn_copy_dep_selection.clicked.connect(lambda *_: self._copy_depletion_table(True))
+        dep_ctrl_row.addWidget(self.btn_copy_dep_selection)
+
+        self.btn_export_dep_table = QPushButton("💾 Export This Table (CSV)")
+        self.btn_export_dep_table.setStyleSheet(
+            "background-color: #0e639c; color: white; padding: 5px; font-weight: bold;")
+        self.btn_export_dep_table.setToolTip(
+            "Save exactly the table shown here, with full numerical precision.")
+        self.btn_export_dep_table.clicked.connect(self.export_depletion_table)
+        dep_ctrl_row.addWidget(self.btn_export_dep_table)
+
+        # Several depletion cases in one folder (a benchmark sweep, a
+        # sensitivity study) are usually compared step by step, which meant
+        # loading them one at a time and pasting the columns together by
+        # hand. Ticking this reads every depletion file in the folder and
+        # puts them side by side in one copyable table.
+        self.chk_compare_cases = QCheckBox("Compare all depletion files in this folder")
+        self.chk_compare_cases.setStyleSheet("font-weight: normal;")
+        self.chk_compare_cases.setToolTip(
+            "Off -- the table shows the loaded file only.\n"
+            "On  -- one block of columns per depletion file found next to it,\n"
+            "       aligned row by row on the step index. Files with fewer\n"
+            "       steps leave 'n/a' in the rows they do not reach, and the\n"
+            "       time/burnup columns of each case are kept so that grids\n"
+            "       which do not match cannot be mistaken for ones that do.")
+        self.chk_compare_cases.toggled.connect(self._on_compare_toggled)
+        dep_ctrl_row.addWidget(self.chk_compare_cases)
+
+        dep_ctrl_row.addStretch()
+        dep_group_layout.addLayout(dep_ctrl_row)
+
+        # Second row: only relevant to the inventory view, so it is hidden
+        # while the table shows k-effective.
+        self.dep_inv_controls = QWidget()
+        dep_inv_row = QHBoxLayout(self.dep_inv_controls)
+        dep_inv_row.setContentsMargins(0, 0, 0, 0)
+
+        dep_inv_row.addWidget(QLabel("Material:"))
+        self.combo_dep_table_mat = QComboBox()
+        self.combo_dep_table_mat.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_mat.setMinimumWidth(150)
+        self.combo_dep_table_mat.currentIndexChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.combo_dep_table_mat)
+
+        dep_inv_row.addWidget(QLabel("Units:"))
+        self.combo_dep_table_unit = QComboBox()
+        self.combo_dep_table_unit.setStyleSheet("font-weight: normal;")
+        self.combo_dep_table_unit.setMinimumWidth(180)
+        self.combo_dep_table_unit.addItems([
+            "Atoms", "Mass (g)", "Weight %", "Atom density (a/b-cm)", "Normalized N/N0"])
+        self.combo_dep_table_unit.currentIndexChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.combo_dep_table_unit)
+
+        dep_inv_row.addWidget(QLabel("Nuclides:"))
+        self.list_dep_table_nuclides = QListWidget()
+        self.list_dep_table_nuclides.setStyleSheet("font-weight: normal;")
+        self.list_dep_table_nuclides.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_dep_table_nuclides.setFixedHeight(72)
+        self.list_dep_table_nuclides.setMinimumWidth(220)
+        self.list_dep_table_nuclides.setToolTip(
+            "Hold Ctrl to add nuclides -- each one becomes a column of the table.")
+        self.list_dep_table_nuclides.itemSelectionChanged.connect(self._populate_depletion_table)
+        dep_inv_row.addWidget(self.list_dep_table_nuclides)
+
+        dep_inv_row.addStretch()
+        dep_group_layout.addWidget(self.dep_inv_controls)
+        self.dep_inv_controls.setVisible(False)
+
+        self.table_depletion = QTableWidget()
+        self.table_depletion.setStyleSheet("font-weight: normal; font-size: 12px;")
+        self.table_depletion.setAlternatingRowColors(True)
+        self.table_depletion.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_depletion.setMinimumHeight(240)
+        self.table_depletion.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        dep_group_layout.addWidget(self.table_depletion)
+
+        # Ctrl+C on the table copies the selected block, the behaviour every
+        # spreadsheet user expects. Scoped to the widget so it never steals
+        # the shortcut from the rest of the page.
+        self._dep_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.table_depletion)
+        self._dep_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._dep_copy_shortcut.activated.connect(lambda *_: self._copy_depletion_table(True))
+
+        layout.addWidget(self.dep_group)
+        self.dep_group.setVisible(False)
+
+        # --- 5. Spectral analysis window button (hidden by default) ---
         self.btn_open_hpge = QPushButton("🚀 Open Advanced HPGe Spectral Analysis")
         self.btn_open_hpge.setStyleSheet(
             "background-color: #8e44ad; color: white; font-weight: bold; font-size: 15px; padding: 12px;")
@@ -610,6 +803,18 @@ class ResultsPageWidget(QWidget):
         print(msg)
 
     def auto_load_latest_statepoint(self):
+        """Open whatever the run just produced.
+
+        A depletion run writes one statepoint per timestep PLUS the single
+        depletion_results.h5 that holds the whole history. The statepoints
+        are created later than that file, so picking the newest by creation
+        time landed on the last step's statepoint: one k-effective, no
+        burnup table, and the depletion results appeared to have vanished.
+        The depletion file therefore wins whenever the run produced one,
+        and the comparison uses modification time -- the depletion file is
+        rewritten after every step, so it is the one that is genuinely most
+        recent.
+        """
         try:
             search_path_main = os.path.join(os.getcwd(), "*.h5")
             search_path_export = os.path.join(os.getcwd(), "export", "*.h5")
@@ -618,11 +823,131 @@ class ResultsPageWidget(QWidget):
             if not h5_files:
                 return
 
-            latest_file = max(h5_files, key=os.path.getctime)
+            latest_file = max(h5_files, key=os.path.getmtime)
+            latest_mtime = os.path.getmtime(latest_file)
+
+            # Depletion output of the same run: written no more than a few
+            # minutes before the last statepoint. An older one is left alone,
+            # so a stale file from a previous session cannot hijack the load.
+            dep_files = [p for p in h5_files
+                         if "depletion_results" in os.path.basename(p).lower()]
+            if not dep_files:
+                dep_files = [p for p in h5_files if self._is_depletion_file(p)]
+            dep_files = [p for p in dep_files
+                         if os.path.getmtime(p) >= latest_mtime - 600]
+
+            if dep_files:
+                latest_file = max(dep_files, key=os.path.getmtime)
+                self._log("🔥 Depletion results detected — loading the full burnup "
+                          f"history from {os.path.basename(latest_file)}.")
+
             self.lbl_file.setText(f"Auto-Loaded: {os.path.basename(latest_file)}")
             self.process_statepoint(latest_file)
         except Exception as e:
             self._log(f"⚠️ Auto-load failed: {e}")
+
+    def _scan_result_files(self):
+        """Every OpenMC result file next to the project, newest first.
+
+        Returns a list of dicts: path, whether it is a depletion file, and
+        for depletion files the number of steps it holds -- read from the
+        dataset shape, so listing a folder never loads the arrays
+        themselves.
+        """
+        try:
+            paths = (glob.glob(os.path.join(os.getcwd(), "*.h5")) +
+                     glob.glob(os.path.join(os.getcwd(), "export", "*.h5")))
+        except Exception:
+            return []
+
+        seen, entries = set(), []
+        for path in paths:
+            try:
+                key = os.path.realpath(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                info = {'path': path,
+                        'mtime': os.path.getmtime(path),
+                        'is_depletion': False,
+                        'steps': None}
+                with h5py.File(path, 'r') as f:
+                    if 'eigenvalues' in f and 'time' in f:
+                        info['is_depletion'] = True
+                        info['steps'] = int(np.asarray(f['eigenvalues'].shape).flat[0])
+                entries.append(info)
+            except Exception:
+                # An unreadable or half-written file must not stop the rest
+                # of the folder from being listed.
+                continue
+
+        entries.sort(key=lambda e: e['mtime'], reverse=True)
+        return entries
+
+    def _refresh_result_file_combo(self, current_path=None):
+        """Refill the results-file dropdown, keeping the loaded file selected."""
+        if not hasattr(self, 'combo_result_files'):
+            return
+        if current_path is None:
+            current_path = getattr(self, '_loaded_path', None)
+
+        entries = self._scan_result_files()
+        self._result_file_entries = entries
+
+        self.combo_result_files.blockSignals(True)
+        self.combo_result_files.clear()
+        if not entries:
+            self.combo_result_files.addItem("No result files in this folder", None)
+        selected_row = 0
+        for row, info in enumerate(entries):
+            name = os.path.basename(info['path'])
+            if os.path.basename(os.path.dirname(info['path'])) == "export":
+                name = os.path.join("export", name)
+            if info['is_depletion']:
+                label = f"🔥 {name} — depletion, {info['steps']} step(s)"
+            else:
+                label = f"📊 {name} — statepoint"
+            self.combo_result_files.addItem(label, info['path'])
+            if current_path and os.path.realpath(info['path']) == os.path.realpath(current_path):
+                selected_row = row
+        self.combo_result_files.setCurrentIndex(selected_row)
+        self.combo_result_files.blockSignals(False)
+
+        n_dep = sum(1 for e in entries if e['is_depletion'])
+        if hasattr(self, 'chk_compare_cases'):
+            self.chk_compare_cases.setEnabled(n_dep > 1)
+            self.chk_compare_cases.setText(
+                f"Compare all depletion files in this folder ({n_dep} found)"
+                if n_dep > 1 else "Compare all depletion files in this folder")
+
+    def _on_result_file_chosen(self, index):
+        """Load whichever file the user picked from the dropdown."""
+        path = self.combo_result_files.itemData(index)
+        if not path or not os.path.exists(path):
+            return
+        if getattr(self, '_loaded_path', None) and \
+                os.path.realpath(path) == os.path.realpath(self._loaded_path):
+            return
+        self.lbl_file.setText(f"Loaded: {os.path.basename(path)}")
+        self.process_statepoint(path)
+
+    @staticmethod
+    def _is_depletion_file(filepath):
+        """True for an openmc.deplete results file.
+
+        Decided by what the file contains -- the 'eigenvalues' and 'time'
+        datasets a depletion run writes -- not by its name. The default name
+        is depletion_results.h5, but a script that renames its output (or
+        keeps several cases side by side) still gets the burnup table
+        instead of a StatePoint read that would fail.
+        """
+        if "depletion_results" in os.path.basename(filepath).lower():
+            return True
+        try:
+            with h5py.File(filepath, 'r') as f:
+                return 'eigenvalues' in f and 'time' in f
+        except Exception:
+            return False
 
     def load_statepoint(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -632,241 +957,331 @@ class ResultsPageWidget(QWidget):
             self.lbl_file.setText(f"Loaded: {os.path.basename(file_path)}")
             self.process_statepoint(file_path)
 
-    def _process_depletion_results(self, filepath):
-        """Analyze depletion file securely using 100% native h5py (Bypassing Windows GUI crash)."""
-        try:
-            with h5py.File(filepath, 'r') as f:
-                if 'eigenvalues' not in f or 'time' not in f:
-                    raise ValueError(
-                        "Not a valid OpenMC depletion results file (missing 'eigenvalues' or 'time' datasets).")
+    def _read_depletion_file(self, filepath, verbose=True):
+        """Everything a depletion results file holds, with no UI touched.
 
-                # 1. Extract K-effective
-                k_data = np.array(f['eigenvalues'])
-                if k_data.ndim == 1:
-                    if k_data.dtype.names is not None:
-                        k_val = k_data[k_data.dtype.names[0]]
-                        k_err = k_data[k_data.dtype.names[1]] if len(k_data.dtype.names) > 1 else np.zeros_like(k_val)
-                    else:
-                        k_val = k_data
-                        k_err = np.zeros_like(k_val)
+        Split out of the panel code so that the multi-file comparison reads
+        the other cases through exactly the same parser: one definition of
+        burnup and one of heavy-metal mass for every file on screen, instead
+        of a second implementation that could drift from this one.
+
+        Read with plain h5py rather than openmc.deplete.Results, which is
+        what keeps this working on Windows without crashing the GUI.
+
+        Returns the dict that is stored as self._depletion_data, plus
+        'x_is_energy' -- True when the file holds no heavy metal to divide
+        by, so the burnup column is really megawatt-days.
+        """
+        with h5py.File(filepath, 'r') as f:
+            if 'eigenvalues' not in f or 'time' not in f:
+                raise ValueError(
+                    "Not a valid OpenMC depletion results file (missing 'eigenvalues' or 'time' datasets).")
+
+            # 1. K-effective -- ONE value per depletion step.
+            #
+            # /eigenvalues is (results, stages, 2). A predictor-corrector
+            # integrator (CECM, LEQI, EPC-RK4) runs TWO stages per step and
+            # stores a k for each, so flattening the array produced twice as
+            # many k values as there are steps and shifted every row: the
+            # burnup of step n was printed next to the corrector k of step
+            # n/2. openmc's own Results.get_keff() takes result.k[0], the
+            # first stage of each step, and that is what a benchmark table
+            # is quoted against -- so that is what is read here.
+            k_data = np.array(f['eigenvalues'])
+            n_stages = 1
+            if k_data.ndim == 1:
+                if k_data.dtype.names is not None:
+                    k_val = k_data[k_data.dtype.names[0]]
+                    k_err = k_data[k_data.dtype.names[1]] if len(k_data.dtype.names) > 1 else np.zeros_like(k_val)
                 else:
-                    if k_data.shape[-1] >= 2:
-                        k_val = k_data[..., 0].flatten()
-                        k_err = k_data[..., 1].flatten()
-                    else:
-                        k_val = k_data[..., 0].flatten()
-                        k_err = np.zeros_like(k_val)
+                    k_val = k_data
+                    k_err = np.zeros_like(k_val)
+            elif k_data.ndim >= 3:
+                n_stages = int(k_data.shape[1])
+                k_val = k_data[:, 0, 0]
+                k_err = k_data[:, 0, 1] if k_data.shape[2] >= 2 else np.zeros_like(k_val)
+            else:
+                k_val = k_data[:, 0]
+                k_err = k_data[:, 1] if k_data.shape[1] >= 2 else np.zeros_like(k_val)
+            k_val = np.asarray(k_val, dtype=float).ravel()
+            k_err = np.asarray(k_err, dtype=float).ravel()
 
-                # 2. Extract Time
-                time_data = np.array(f['time'])
-                if time_data.ndim == 2 and time_data.shape[1] == 2:
-                    time_s = np.append(time_data[:, 0], time_data[-1, 1])
+            # 2. Time -- the START time of each stored result.
+            #
+            # /time is (results, 2) = [start, end] of each result, and the
+            # final state is already stored as its own result, whose start
+            # and end are the same instant. Appending that end time again
+            # therefore invented an extra step at the bottom of the table,
+            # duplicating the last time with the next stage's k. The end
+            # time is only appended when it really is beyond the last start,
+            # i.e. when the file stops without storing the final state.
+            time_data = np.array(f['time'], dtype=float)
+            if time_data.ndim == 2 and time_data.shape[1] == 2:
+                time_s = time_data[:, 0]
+                if not np.isclose(time_data[-1, 1], time_data[-1, 0]):
+                    time_s = np.append(time_s, time_data[-1, 1])
+            else:
+                time_s = time_data.flatten()
+            time_days = time_s / (24 * 60 * 60)
+
+            min_len = min(len(time_days), len(k_val))
+            time_days = time_days[:min_len]
+            k_val = k_val[:min_len]
+            k_err = k_err[:min_len]
+
+            # 3. Extract Burnup OR calculate Energy (MWd)
+            burnup_data = None
+            x_is_energy = False
+            if 'burnup' in f:
+                b_data = np.array(f['burnup'], dtype=float)
+                if b_data.ndim > 1:
+                    # Same (results, stages) layout as the eigenvalues: the
+                    # stages of one step share a burnup, so adding them
+                    # would double it. Anything else is a per-material
+                    # breakdown, which does add up to the total.
+                    burnup_data = (b_data[:, 0] if b_data.shape[1] == n_stages
+                                   else b_data.sum(axis=1))
                 else:
-                    time_s = time_data.flatten()
-                time_days = time_s / (24 * 60 * 60)
-
-                min_len = min(len(time_days), len(k_val))
-                time_days = time_days[:min_len]
-                k_val = k_val[:min_len]
-                k_err = k_err[:min_len]
-
-                # 3. Extract Burnup OR calculate Energy (MWd)
-                burnup_data = None
-                self._x_is_energy = False
-                if 'burnup' in f:
-                    b_data = np.array(f['burnup'])
-                    if b_data.ndim > 1:
-                        burnup_data = b_data.sum(axis=1)
-                    else:
-                        burnup_data = b_data
-                    burnup_data = burnup_data[:min_len]
-                elif 'source_rate' in f:
-                    try:
-                        power_W = np.array(f['source_rate']).flatten()
-                        power_MW = power_W / 1e6
-                        if len(power_MW) > 0:
-                            dt_days = np.diff(time_days)
-                            energy_MWd = np.zeros(len(time_days))
-                            energy_MWd[1:] = np.cumsum(power_MW[:len(dt_days)] * dt_days)
-                            burnup_data = energy_MWd
-                            self._x_is_energy = True
-                    except Exception:
-                        pass
-
-                # 4. Extract nuclide / material indices and the atom inventory.
-                #
-                # The layout openmc.deplete actually writes is:
-                #     /nuclides/<name>     Group -> attrs['atom number index']
-                #     /materials/<mat_id>  Group -> attrs['index'], attrs['volume']
-                #     /number              Dataset (steps, stages, materials, nuclides)
-                #
-                # Two things worth spelling out, because both silently break the
-                # isotope curves if assumed otherwise:
-                #   * /nuclides is a GROUP whose SUBGROUP NAMES are the nuclide
-                #     names -- it is not a string Dataset. Testing it with
-                #     isinstance(..., h5py.Dataset) therefore never matches and
-                #     the isotope list comes back empty, leaving the Y-axis
-                #     dropdown with nothing to choose from.
-                #   * /number has FOUR dimensions, not three. Used as-is,
-                #     atoms[:, idx] returns a 3-D slab instead of a single curve.
-                nuc_index = {}
-                mat_index = {}
-                mat_volume = {}
-                atoms_by_mat = None
-
+                    burnup_data = b_data
+                burnup_data = burnup_data[:min_len]
+            elif 'source_rate' in f:
                 try:
-                    if 'nuclides' in f and isinstance(f['nuclides'], h5py.Group):
-                        for _name, _node in f['nuclides'].items():
-                            _idx = _node.attrs.get('atom number index',
-                                                   _node.attrs.get('index'))
-                            if _idx is not None:
-                                nuc_index[str(_name)] = int(_idx)
+                    # (results, stages): every stage of a predictor-
+                    # corrector step is run at that step's own power, so
+                    # the first stage is the power of the step. Flattening
+                    # instead interleaves the stages, which shifts every
+                    # burnup value after the first step.
+                    _sr = np.array(f['source_rate'], dtype=float)
+                    power_W = _sr[:, 0] if _sr.ndim == 2 and _sr.shape[1] else _sr.flatten()
+                    power_MW = power_W / 1e6
+                    if len(power_MW) > 0:
+                        dt_days = np.diff(time_days)
+                        energy_MWd = np.zeros(len(time_days))
+                        energy_MWd[1:] = np.cumsum(power_MW[:len(dt_days)] * dt_days)
+                        burnup_data = energy_MWd
+                        x_is_energy = True
+                except Exception:
+                    pass
 
-                    if 'materials' in f and isinstance(f['materials'], h5py.Group):
-                        for _name, _node in f['materials'].items():
-                            _idx = _node.attrs.get('index')
-                            if _idx is not None:
-                                mat_index[str(_name)] = int(_idx)
-                            # Volume is stored alongside the index and is what
-                            # makes atom DENSITY (atom/b-cm) -- the unit OpenMC
-                            # inputs actually use -- computable at all.
-                            _vol = _node.attrs.get('volume')
-                            if _vol is not None:
-                                mat_volume[str(_name)] = float(_vol)
+            # 4. Extract nuclide / material indices and the atom inventory.
+            #
+            # The layout openmc.deplete actually writes is:
+            #     /nuclides/<name>     Group -> attrs['atom number index']
+            #     /materials/<mat_id>  Group -> attrs['index'], attrs['volume']
+            #     /number              Dataset (steps, stages, materials, nuclides)
+            #
+            # Two things worth spelling out, because both silently break the
+            # isotope curves if assumed otherwise:
+            #   * /nuclides is a GROUP whose SUBGROUP NAMES are the nuclide
+            #     names -- it is not a string Dataset. Testing it with
+            #     isinstance(..., h5py.Dataset) therefore never matches and
+            #     the isotope list comes back empty, leaving the Y-axis
+            #     dropdown with nothing to choose from.
+            #   * /number has FOUR dimensions, not three. Used as-is,
+            #     atoms[:, idx] returns a 3-D slab instead of a single curve.
+            nuc_index = {}
+            mat_index = {}
+            mat_volume = {}
+            atoms_by_mat = None
 
-                    if 'number' in f and isinstance(f['number'], h5py.Dataset):
-                        _num = np.array(f['number'], dtype=float)
-                        if _num.ndim == 4:
-                            atoms_by_mat = _num[:, 0, :, :]      # first stage
-                        elif _num.ndim == 3:
-                            atoms_by_mat = _num
-                        elif _num.ndim == 2:
-                            atoms_by_mat = _num[:, None, :]
-                        if atoms_by_mat is not None:
-                            atoms_by_mat = atoms_by_mat[:min_len]
+            try:
+                if 'nuclides' in f and isinstance(f['nuclides'], h5py.Group):
+                    for _name, _node in f['nuclides'].items():
+                        _idx = _node.attrs.get('atom number index',
+                                               _node.attrs.get('index'))
+                        if _idx is not None:
+                            nuc_index[str(_name)] = int(_idx)
 
-                except Exception as ex:
+                if 'materials' in f and isinstance(f['materials'], h5py.Group):
+                    for _name, _node in f['materials'].items():
+                        _idx = _node.attrs.get('index')
+                        if _idx is not None:
+                            mat_index[str(_name)] = int(_idx)
+                        # Volume is stored alongside the index and is what
+                        # makes atom DENSITY (atom/b-cm) -- the unit OpenMC
+                        # inputs actually use -- computable at all.
+                        _vol = _node.attrs.get('volume')
+                        if _vol is not None:
+                            mat_volume[str(_name)] = float(_vol)
+
+                if 'number' in f and isinstance(f['number'], h5py.Dataset):
+                    _num = np.array(f['number'], dtype=float)
+                    if _num.ndim == 4:
+                        atoms_by_mat = _num[:, 0, :, :]      # first stage
+                    elif _num.ndim == 3:
+                        atoms_by_mat = _num
+                    elif _num.ndim == 2:
+                        atoms_by_mat = _num[:, None, :]
+                    if atoms_by_mat is not None:
+                        atoms_by_mat = atoms_by_mat[:min_len]
+
+            except Exception as ex:
+                if verbose:
                     self._log(f"⚠️ Notice: minor issue while extracting isotope counts: {ex}")
 
-                # Ordered by the index stored in the file, so a name's position
-                # in this list always matches its column in atoms_by_mat.
-                nuclides = sorted(nuc_index, key=lambda _n: nuc_index[_n])
-                materials = sorted(mat_index, key=lambda _m: mat_index[_m])
+            # Ordered by the index stored in the file, so a name's position
+            # in this list always matches its column in atoms_by_mat.
+            nuclides = sorted(nuc_index, key=lambda _n: nuc_index[_n])
+            materials = sorted(mat_index, key=lambda _m: mat_index[_m])
 
-                # 5. Real burnup (MWd/kgHM).
-                #
-                # The energy computed above is MWd -- it only becomes burnup
-                # after dividing by the initial heavy-metal mass. That mass is
-                # already implicit in the file (the step-0 actinide inventory),
-                # so it is derived from the results themselves rather than asked
-                # of the user or re-read from the script: a mass taken from the
-                # script could belong to a model that has since been edited,
-                # whereas this one is guaranteed to match the run that produced
-                # these numbers.
-                hm_mass_kg = 0.0
-                hm_mass_by_mat = {}
-                if atoms_by_mat is not None and atoms_by_mat.ndim == 3 and len(atoms_by_mat):
-                    initial = atoms_by_mat[0]                       # (materials, nuclides)
-                    for _m, _mi in mat_index.items():
-                        if _mi < initial.shape[0]:
-                            hm_mass_by_mat[_m] = _heavy_metal_mass_kg(initial[_mi], nuc_index)
-                    hm_mass_kg = float(sum(hm_mass_by_mat.values()))
+            # 5. Real burnup (MWd/kgHM).
+            #
+            # The energy computed above is MWd -- it only becomes burnup
+            # after dividing by the initial heavy-metal mass. That mass is
+            # already implicit in the file (the step-0 actinide inventory),
+            # so it is derived from the results themselves rather than asked
+            # of the user or re-read from the script: a mass taken from the
+            # script could belong to a model that has since been edited,
+            # whereas this one is guaranteed to match the run that produced
+            # these numbers.
+            hm_mass_kg = 0.0
+            hm_mass_by_mat = {}
+            if atoms_by_mat is not None and atoms_by_mat.ndim == 3 and len(atoms_by_mat):
+                initial = atoms_by_mat[0]                       # (materials, nuclides)
+                for _m, _mi in mat_index.items():
+                    if _mi < initial.shape[0]:
+                        hm_mass_by_mat[_m] = _heavy_metal_mass_kg(initial[_mi], nuc_index)
+                hm_mass_kg = float(sum(hm_mass_by_mat.values()))
 
-                if burnup_data is not None and hm_mass_kg > 0 and self._x_is_energy:
-                    burnup_data = np.asarray(burnup_data, dtype=float) / hm_mass_kg
-                    self._x_is_energy = False                        # now genuine MWd/kgHM
+            if burnup_data is not None and hm_mass_kg > 0 and x_is_energy:
+                burnup_data = np.asarray(burnup_data, dtype=float) / hm_mass_kg
+                x_is_energy = False                        # now genuine MWd/kgHM
+                if verbose:
                     self._log(f"✅ Burnup axis available: initial heavy-metal mass "
                               f"= {hm_mass_kg:.4g} kg (from the step-0 actinide inventory).")
-                elif self._x_is_energy:
-                    self._log("ℹ️ No heavy metal found in the inventory -- the burnup axis will "
-                              "show total energy produced (MWd) instead of MWd/kgHM.")
+            elif x_is_energy and verbose:
+                self._log("ℹ️ No heavy metal found in the inventory -- the burnup axis will "
+                          "show total energy produced (MWd) instead of MWd/kgHM.")
 
-                # Store data for plotting
-                self._depletion_data = {
-                    'time_days': time_days,
-                    'burnup': burnup_data,
-                    'k_val': k_val,
-                    'k_err': k_err,
-                    'nuclides': nuclides,
-                    'materials': materials,
-                    'nuc_index': nuc_index,
-                    'mat_index': mat_index,
-                    'atoms_by_mat': atoms_by_mat,
-                    'mat_volume': mat_volume,
-                    'hm_mass_kg': hm_mass_kg,
-                    'hm_mass_by_mat': hm_mass_by_mat
-                }
+            # Everything the panel, the plot and the comparison need.
+            return {
+                'time_days': time_days,
+                'burnup': burnup_data,
+                'k_val': k_val,
+                'k_err': k_err,
+                'nuclides': nuclides,
+                'materials': materials,
+                'nuc_index': nuc_index,
+                'mat_index': mat_index,
+                'atoms_by_mat': atoms_by_mat,
+                'mat_volume': mat_volume,
+                'hm_mass_kg': hm_mass_kg,
+                'hm_mass_by_mat': hm_mass_by_mat,
+                'x_is_energy': x_is_energy,
+                'path': filepath,
+            }
 
-                # --- Update UI ---
-                final_k = float(k_val[-1])
-                final_err = float(k_err[-1])
+    def _process_depletion_results(self, filepath):
+        """Read a depletion file and put the whole burnup history on screen."""
+        try:
+            data = self._read_depletion_file(filepath)
+            self._depletion_data = data
+            self._depletion_path = filepath
+            self._x_is_energy = data['x_is_energy']
 
-                self.lbl_keff.setText(f"Final k-effective = {final_k:.5f} ± {final_err:.5f}")
-                self.lbl_keff.setStyleSheet("font-size: 26px; font-weight: bold; color: #d35400; padding: 20px;")
+            time_days = data['time_days']
+            k_val = data['k_val']
+            k_err = data['k_err']
+            nuclides = data['nuclides']
+            materials = data['materials']
+            nuc_index = data['nuc_index']
 
-                self.combo_tallies.blockSignals(True)
-                self.combo_tallies.clear()
-                self.combo_tallies.addItem("Depletion Results", -1)
-                self.combo_tallies.blockSignals(False)
-                self.btn_open_hpge.setVisible(False)
+            # --- Update UI ---
+            final_k = float(k_val[-1])
+            final_err = float(k_err[-1])
 
-                # Populate K-eff and Time table
-                self.table_tally.setRowCount(len(time_days))
-                self.table_tally.setColumnCount(3)
-                self.table_tally.setHorizontalHeaderLabels(["Time [Days]", "k-effective", "Std Dev"])
-                self.table_tally.setUpdatesEnabled(False)
+            self.lbl_keff.setText(f"Final k-effective = {final_k:.5f} ± {final_err:.5f}")
+            self.lbl_keff.setStyleSheet("font-size: 26px; font-weight: bold; color: #d35400; padding: 20px;")
 
-                for row in range(len(time_days)):
-                    item_time = QTableWidgetItem(f"{time_days[row]:.4f}")
-                    item_k = QTableWidgetItem(f"{k_val[row]:.5f}")
-                    item_err = QTableWidgetItem(f"{k_err[row]:.5f}")
+            self.combo_tallies.blockSignals(True)
+            self.combo_tallies.clear()
+            self.combo_tallies.addItem("Depletion Results", -1)
+            self.combo_tallies.blockSignals(False)
+            self.btn_open_hpge.setVisible(False)
 
-                    item_time.setFlags(item_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    item_k.setFlags(item_k.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    item_err.setFlags(item_err.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            # Populate K-eff and Time table
+            self.table_tally.setRowCount(len(time_days))
+            self.table_tally.setColumnCount(3)
+            self.table_tally.setHorizontalHeaderLabels(["Time [Days]", "k-effective", "Std Dev"])
+            self.table_tally.setUpdatesEnabled(False)
 
-                    self.table_tally.setItem(row, 0, item_time)
-                    self.table_tally.setItem(row, 1, item_k)
-                    self.table_tally.setItem(row, 2, item_err)
-                self.table_tally.setUpdatesEnabled(True)
+            for row in range(len(time_days)):
+                item_time = QTableWidgetItem(f"{time_days[row]:.4f}")
+                item_k = QTableWidgetItem(f"{k_val[row]:.5f}")
+                item_err = QTableWidgetItem(f"{k_err[row]:.5f}")
 
-                # Update independent plot window settings
-                self.tally_plot_dialog.combo_plot_type.setVisible(False)
-                self.tally_plot_dialog.depletion_controls.setVisible(True)
+                item_time.setFlags(item_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item_k.setFlags(item_k.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item_err.setFlags(item_err.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-                # Fill the nuclide list, most-studied ones first so the common
-                # case needs no scrolling.
-                popular_isotopes = ['U235', 'U238', 'Pu239', 'Pu240', 'Pu241',
-                                    'Xe135', 'Sm149', 'Cs137', 'Sr90']
-                lw = self.tally_plot_dialog.list_dep_nuclides
-                lw.blockSignals(True)
-                lw.clear()
-                ordered = [n for n in popular_isotopes if n in nuc_index]
-                ordered += [n for n in nuclides if n not in ordered]
-                lw.addItems(ordered)
-                if lw.count():
-                    lw.item(0).setSelected(True)
-                lw.blockSignals(False)
+                self.table_tally.setItem(row, 0, item_time)
+                self.table_tally.setItem(row, 1, item_k)
+                self.table_tally.setItem(row, 2, item_err)
+            self.table_tally.setUpdatesEnabled(True)
 
-                # Populate the material selector ("All" first, then each one)
-                self.tally_plot_dialog.combo_dep_mat.blockSignals(True)
-                self.tally_plot_dialog.combo_dep_mat.clear()
-                self.tally_plot_dialog.combo_dep_mat.addItem("All materials (sum)", None)
-                for _m in materials:
-                    self.tally_plot_dialog.combo_dep_mat.addItem(f"Material {_m}", _m)
-                self.tally_plot_dialog.combo_dep_mat.setEnabled(bool(materials))
-                self.tally_plot_dialog.combo_dep_mat.blockSignals(False)
+            # Update independent plot window settings
+            self.tally_plot_dialog.combo_plot_type.setVisible(False)
+            self.tally_plot_dialog.depletion_controls.setVisible(True)
 
-                if not nuclides:
-                    self._log("ℹ️ No nuclide inventory found in this depletion file -- "
-                              "only k-effective can be plotted.")
-                else:
-                    self._log(f"✅ Depletion inventory loaded: {len(nuclides)} nuclide(s) "
-                              f"across {len(materials)} material(s).")
+            # Fill the nuclide list, most-studied ones first so the common
+            # case needs no scrolling.
+            popular_isotopes = ['U235', 'U238', 'Pu239', 'Pu240', 'Pu241',
+                                'Xe135', 'Sm149', 'Cs137', 'Sr90']
+            lw = self.tally_plot_dialog.list_dep_nuclides
+            lw.blockSignals(True)
+            lw.clear()
+            ordered = [n for n in popular_isotopes if n in nuc_index]
+            ordered += [n for n in nuclides if n not in ordered]
+            lw.addItems(ordered)
+            if lw.count():
+                lw.item(0).setSelected(True)
+            lw.blockSignals(False)
 
-                # Plot data immediately and open window
-                self._plot_depletion_data()
-                self.open_tally_plot_window()
+            # Populate the material selector ("All" first, then each one)
+            self.tally_plot_dialog.combo_dep_mat.blockSignals(True)
+            self.tally_plot_dialog.combo_dep_mat.clear()
+            self.tally_plot_dialog.combo_dep_mat.addItem("All materials (sum)", None)
+            for _m in materials:
+                self.tally_plot_dialog.combo_dep_mat.addItem(f"Material {_m}", _m)
+            self.tally_plot_dialog.combo_dep_mat.setEnabled(bool(materials))
+            self.tally_plot_dialog.combo_dep_mat.blockSignals(False)
+
+            # The same choices for the results table on the main page,
+            # which has its own selectors so it works without ever
+            # opening the plot window.
+            self.combo_dep_table_mat.blockSignals(True)
+            self.combo_dep_table_mat.clear()
+            self.combo_dep_table_mat.addItem("All materials (sum)", None)
+            for _m in materials:
+                self.combo_dep_table_mat.addItem(f"Material {_m}", _m)
+            self.combo_dep_table_mat.setEnabled(bool(materials))
+            self.combo_dep_table_mat.blockSignals(False)
+
+            tlw = self.list_dep_table_nuclides
+            tlw.blockSignals(True)
+            tlw.clear()
+            tlw.addItems(ordered)
+            for _row in range(min(3, tlw.count())):
+                tlw.item(_row).setSelected(True)
+            tlw.blockSignals(False)
+
+            if not nuclides:
+                self._log("ℹ️ No nuclide inventory found in this depletion file -- "
+                          "only k-effective can be plotted.")
+            else:
+                self._log(f"✅ Depletion inventory loaded: {len(nuclides)} nuclide(s) "
+                          f"across {len(materials)} material(s).")
+
+            # Show the results table straight away. A burnup run used to
+            # end with an empty-looking page unless the raw table was
+            # expanded by hand; now every step is on screen the moment
+            # the file is read, whatever the run length.
+            self.dep_group.setVisible(True)
+            self._populate_depletion_table()
+
+            # Plot data immediately and open window
+            self._plot_depletion_data()
+            self.open_tally_plot_window()
 
         except Exception as e:
             QMessageBox.critical(self, "Depletion Read Error", f"Could not read depletion file:\n{str(e)}")
@@ -983,7 +1398,7 @@ class ResultsPageWidget(QWidget):
         if unit == "Mass (g)":
             if not mass_number:
                 return None, "mass number unknown"
-            return atoms * mass_number / _AVOGADRO, None
+            return atoms * _nuclide_molar_mass(nuc_name, mass_number) / _AVOGADRO, None
 
         if unit == "Weight %":
             if not mass_number:
@@ -993,9 +1408,10 @@ class ResultsPageWidget(QWidget):
             for name, idx in nuc_index.items():
                 _e, a = _split_nuclide_name(name)
                 if a and idx < block.shape[1]:
-                    total += block[:, idx] * a
+                    total += block[:, idx] * _nuclide_molar_mass(name, a)
+            this_mass = _nuclide_molar_mass(nuc_name, mass_number)
             with np.errstate(divide='ignore', invalid='ignore'):
-                pct = np.where(total > 0, atoms * mass_number / total * 100.0, np.nan)
+                pct = np.where(total > 0, atoms * this_mass / total * 100.0, np.nan)
             return pct, None
 
         if unit == "Atom density (a/b-cm)":
@@ -1010,6 +1426,371 @@ class ResultsPageWidget(QWidget):
             return atoms / atoms[0], None
 
         return atoms, None
+
+    # ------------------------------------------------------------------
+    # Depletion results table
+    # ------------------------------------------------------------------
+    def _burnup_column_header(self):
+        """Header for the burnup column, honest about which quantity it is.
+
+        MWd/kgHM and GWd/MTU are the same number (1 MWd/kg = 1 GWd/tonne),
+        so both are named -- benchmark tables are usually quoted in the
+        second one. When no heavy metal was found in the inventory the
+        column holds the energy produced instead, and says so.
+        """
+        if getattr(self, '_x_is_energy', False):
+            return "Energy (MWd)"
+        return "Burnup (MWd/kgHM = GWd/MTU)"
+
+    def _format_inventory_value(self, value, unit):
+        """Inventory numbers span 20 decades (atoms) or sit near unity
+        (weight %, N/N0), so the format follows the unit rather than one
+        compromise that ruins both."""
+        if value is None or not np.isfinite(value):
+            return "n/a"
+        if unit in ("Weight %", "Normalized N/N0"):
+            return f"{value:.6f}"
+        return f"{value:.6E}"
+
+    def _build_depletion_table(self):
+        """Every row the loaded depletion file contains, ready to display.
+
+        Returns (headers, rows, columns, notes):
+            headers -- column titles
+            rows    -- list of lists of already-formatted strings
+            columns -- {title: numpy array} at full precision, for CSV export
+            notes   -- anything that had to be skipped, for the summary line
+
+        The number of rows is whatever the file holds: a four-step run and
+        an eighty-step burnup sweep are handled identically, because the
+        steps are read from the file and never assumed.
+        """
+        if getattr(self, 'chk_compare_cases', None) is not None and \
+                self.chk_compare_cases.isChecked():
+            return self._build_comparison_table()
+
+        d = getattr(self, '_depletion_data', {}) or {}
+        if not d:
+            return [], [], {}, []
+
+        time_days = np.asarray(d.get('time_days', []), dtype=float)
+        k_val = np.asarray(d.get('k_val', []), dtype=float)
+        k_err = np.asarray(d.get('k_err', []), dtype=float)
+        burnup = d.get('burnup')
+        n_steps = len(time_days)
+        if n_steps == 0:
+            return [], [], {}, []
+
+        burnup_arr = np.asarray(burnup, dtype=float) if burnup is not None else None
+        notes = []
+
+        headers = ["Step", "Time (days)"]
+        columns = {"Step": np.arange(n_steps),
+                   "Time (days)": time_days}
+        if burnup_arr is not None:
+            b_header = self._burnup_column_header()
+            headers.append(b_header)
+            columns[b_header] = burnup_arr
+        else:
+            notes.append("no burnup/power data stored in this file")
+
+        view = self.combo_dep_table_view.currentText()
+
+        if view == "Nuclide inventory":
+            unit = self.combo_dep_table_unit.currentText()
+            mat_sel = self.combo_dep_table_mat.currentData()
+            selected = [i.text() for i in self.list_dep_table_nuclides.selectedItems()]
+            series = []
+            for nuc_name in selected:
+                values, reason = self._dep_series(nuc_name, unit, mat_sel)
+                if values is None:
+                    notes.append(f"{nuc_name} skipped ({reason})")
+                    continue
+                title = f"{nuc_name} [{unit}]"
+                headers.append(title)
+                arr = np.asarray(values, dtype=float)
+                columns[title] = arr
+                series.append((title, arr))
+            if not selected:
+                notes.append("select one or more nuclides to add their columns")
+        else:
+            unit = None
+            rho, rho_err = _reactivity_pcm(k_val, k_err)
+            series = []
+            for title, arr in (("k-effective", k_val),
+                               ("Std Dev (k)", k_err),
+                               ("Reactivity (pcm)", rho),
+                               ("Std Dev (pcm)", rho_err)):
+                headers.append(title)
+                columns[title] = arr
+                series.append((title, arr))
+
+        rows = []
+        for i in range(n_steps):
+            row = [str(i), f"{time_days[i]:.4f}"]
+            if burnup_arr is not None:
+                row.append(f"{burnup_arr[i]:.4f}" if i < len(burnup_arr) else "n/a")
+            for title, arr in series:
+                if i >= len(arr):
+                    row.append("n/a")
+                elif view == "Nuclide inventory":
+                    row.append(self._format_inventory_value(float(arr[i]), unit))
+                elif title.startswith("k-effective") or title.startswith("Std Dev (k)"):
+                    row.append(f"{arr[i]:.5f}")
+                else:
+                    row.append(f"{arr[i]:.1f}" if np.isfinite(arr[i]) else "n/a")
+            rows.append(row)
+
+        return headers, rows, columns, notes
+
+    def _load_all_depletion_files(self):
+        """Read every depletion file in the folder, newest first.
+
+        Results are cached per (path, mtime), so switching the comparison on
+        and off, or changing units, does not re-read the files; a file that
+        is rewritten by a new run falls out of the cache by itself.
+        """
+        cache = getattr(self, '_dep_file_cache', None)
+        if cache is None:
+            cache = self._dep_file_cache = {}
+
+        loaded, failed = [], []
+        for info in self._scan_result_files():
+            if not info['is_depletion']:
+                continue
+            key = (os.path.realpath(info['path']), info['mtime'])
+            if key not in cache:
+                try:
+                    cache[key] = self._read_depletion_file(info['path'], verbose=False)
+                except Exception as ex:
+                    failed.append(f"{os.path.basename(info['path'])} ({ex})")
+                    continue
+            loaded.append((info['path'], cache[key]))
+
+        # The file on screen leads, so its columns are the first ones read.
+        current = getattr(self, '_loaded_path', None)
+        if current:
+            loaded.sort(key=lambda item: os.path.realpath(item[0]) != os.path.realpath(current))
+        return loaded, failed
+
+    def _build_comparison_table(self):
+        """One block of columns per depletion file, aligned on the step index.
+
+        Cases are lined up by step number rather than by burnup: two runs
+        only share an x-axis if they were given the same steps, and silently
+        interpolating one onto the other's grid would invent numbers that
+        were never computed. Each case therefore keeps its own time and
+        burnup columns, so a mismatched grid is visible at a glance.
+        """
+        loaded, failed = self._load_all_depletion_files()
+        notes = list(failed)
+        if not loaded:
+            return [], [], {}, ["no depletion files found in this folder"]
+
+        headers = ["Step"]
+        columns = {}
+        blocks = []
+        n_rows = 0
+        for path, data in loaded:
+            label = os.path.splitext(os.path.basename(path))[0]
+            time_days = np.asarray(data.get('time_days', []), dtype=float)
+            k_val = np.asarray(data.get('k_val', []), dtype=float)
+            k_err = np.asarray(data.get('k_err', []), dtype=float)
+            burnup = data.get('burnup')
+            burnup_arr = np.asarray(burnup, dtype=float) if burnup is not None else None
+            n_rows = max(n_rows, len(time_days))
+
+            b_name = ("Energy (MWd)" if data.get('x_is_energy')
+                      else "Burnup (MWd/kgHM = GWd/MTU)")
+            block = [(f"{label} — Time (days)", time_days, "{:.4f}")]
+            if burnup_arr is not None:
+                block.append((f"{label} — {b_name}", burnup_arr, "{:.4f}"))
+            else:
+                notes.append(f"{label}: no burnup data stored")
+            block.append((f"{label} — k-effective", k_val, "{:.5f}"))
+            block.append((f"{label} — Std Dev (k)", k_err, "{:.5f}"))
+
+            for title, arr, _fmt in block:
+                headers.append(title)
+                columns[title] = arr
+            blocks.append(block)
+
+        columns = dict([("Step", np.arange(n_rows))] + list(columns.items()))
+
+        rows = []
+        for i in range(n_rows):
+            row = [str(i)]
+            for block in blocks:
+                for _title, arr, fmt in block:
+                    row.append(fmt.format(arr[i]) if i < len(arr) else "n/a")
+            rows.append(row)
+
+        if len(loaded) > 1:
+            lengths = {len(np.asarray(d.get('time_days', []))) for _p, d in loaded}
+            if len(lengths) > 1:
+                notes.append("the cases do not have the same number of steps — "
+                             "rows are aligned on the step index, not on burnup")
+        return headers, rows, columns, notes
+
+    def _populate_depletion_table(self):
+        """Fill and show the depletion table. Called automatically as soon
+        as a depletion file is loaded -- no button press needed."""
+        if not hasattr(self, 'table_depletion'):
+            return
+
+        headers, rows, columns, notes = self._build_depletion_table()
+        self._dep_table_columns = columns
+
+        self.table_depletion.setUpdatesEnabled(False)
+        self.table_depletion.clear()
+        self.table_depletion.setRowCount(len(rows))
+        self.table_depletion.setColumnCount(len(headers))
+        self.table_depletion.setHorizontalHeaderLabels(headers)
+
+        for r, row in enumerate(rows):
+            for c, text in enumerate(row):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if c > 0:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                                          Qt.AlignmentFlag.AlignVCenter)
+                self.table_depletion.setItem(r, c, item)
+        self.table_depletion.setUpdatesEnabled(True)
+
+        if getattr(self, 'chk_compare_cases', None) is not None and \
+                self.chk_compare_cases.isChecked():
+            n_files = max(0, (len(headers) - 1)) and len(
+                {h.split(" — ")[0] for h in headers[1:]})
+            text = (f"🔁 Comparing {n_files} depletion file(s) side by side  |  "
+                    f"{len(rows)} row(s), aligned on the step index")
+            if notes:
+                text += "\n⚠️ " + "; ".join(notes)
+            self.lbl_dep_summary.setText(text)
+        else:
+            self.lbl_dep_summary.setText(self._depletion_summary_text(len(rows), notes))
+
+    def _depletion_summary_text(self, n_rows, notes):
+        """One line stating what was extracted, so the table can be trusted
+        without opening the file: how many steps, the range covered, and how
+        k moved across them."""
+        d = getattr(self, '_depletion_data', {}) or {}
+        if not d or n_rows == 0:
+            return "No depletion results loaded."
+
+        time_days = np.asarray(d.get('time_days', []), dtype=float)
+        k_val = np.asarray(d.get('k_val', []), dtype=float)
+        k_err = np.asarray(d.get('k_err', []), dtype=float)
+        burnup = d.get('burnup')
+
+        parts = [f"✅ {n_rows} depletion step(s) extracted automatically"]
+        if time_days.size:
+            parts.append(f"time {time_days[0]:.4g} → {time_days[-1]:.4g} d")
+        if burnup is not None and len(burnup):
+            b = np.asarray(burnup, dtype=float)
+            unit = "MWd" if getattr(self, '_x_is_energy', False) else "MWd/kgHM (= GWd/MTU)"
+            parts.append(f"burnup {b[0]:.4g} → {b[-1]:.4g} {unit}")
+        if k_val.size:
+            parts.append(f"k {k_val[0]:.5f} → {k_val[-1]:.5f}")
+            parts.append(f"final k = {k_val[-1]:.5f} ± {k_err[-1]:.5f}"
+                         if k_err.size else f"final k = {k_val[-1]:.5f}")
+            x_vals = (np.asarray(burnup, dtype=float)
+                      if (burnup is not None and len(burnup) == len(k_val))
+                      else time_days)
+            x_end, _ = _cycle_end(x_vals, k_val)
+            if x_end is not None:
+                unit = ("d" if x_vals is time_days
+                        else ("MWd" if getattr(self, '_x_is_energy', False) else "MWd/kgHM"))
+                parts.append(f"cycle end (k = 1) at {x_end:.4g} {unit}")
+        text = "  |  ".join(parts)
+        if notes:
+            text += "\n⚠️ " + "; ".join(notes)
+        return text
+
+    def _on_compare_toggled(self, checked):
+        """While several cases are shown side by side there is no single
+        material or nuclide selection to apply, so those controls step
+        aside rather than pretending to affect the table."""
+        self.combo_dep_table_view.setEnabled(not checked)
+        if checked:
+            self.dep_inv_controls.setVisible(False)
+        else:
+            self.dep_inv_controls.setVisible(
+                self.combo_dep_table_view.currentText() == "Nuclide inventory")
+        self._populate_depletion_table()
+
+    def _on_dep_table_view_changed(self):
+        """Nuclide/material/unit pickers only apply to the inventory view."""
+        is_inventory = self.combo_dep_table_view.currentText() == "Nuclide inventory"
+        self.dep_inv_controls.setVisible(is_inventory)
+        self._populate_depletion_table()
+
+    def _copy_depletion_table(self, selection_only=False):
+        """Put the table on the clipboard as tab-separated text -- the format
+        Excel, OriginLab and Google Sheets all paste as proper cells."""
+        if not hasattr(self, 'table_depletion') or self.table_depletion.rowCount() == 0:
+            QMessageBox.warning(self, "Nothing to Copy",
+                                "No depletion results are loaded yet.")
+            return
+
+        n_rows = self.table_depletion.rowCount()
+        n_cols = self.table_depletion.columnCount()
+
+        if selection_only:
+            ranges = self.table_depletion.selectedRanges()
+            if not ranges:
+                # Ctrl+C with nothing selected is a request for the table,
+                # not an error.
+                selection_only = False
+            else:
+                lines = []
+                for rng in ranges:
+                    header = [self.table_depletion.horizontalHeaderItem(c).text()
+                              for c in range(rng.leftColumn(), rng.rightColumn() + 1)]
+                    lines.append("\t".join(header))
+                    for r in range(rng.topRow(), rng.bottomRow() + 1):
+                        cells = []
+                        for c in range(rng.leftColumn(), rng.rightColumn() + 1):
+                            item = self.table_depletion.item(r, c)
+                            cells.append(item.text() if item else "")
+                        lines.append("\t".join(cells))
+                QApplication.clipboard().setText("\n".join(lines))
+                self._log(f"📋 Copied {sum(rng.rowCount() for rng in ranges)} selected "
+                          f"row(s) of the depletion table to the clipboard.")
+                return
+
+        lines = ["\t".join(self.table_depletion.horizontalHeaderItem(c).text()
+                           for c in range(n_cols))]
+        for r in range(n_rows):
+            cells = []
+            for c in range(n_cols):
+                item = self.table_depletion.item(r, c)
+                cells.append(item.text() if item else "")
+            lines.append("\t".join(cells))
+
+        QApplication.clipboard().setText("\n".join(lines))
+        self._log(f"📋 Depletion table copied to the clipboard "
+                  f"({n_rows} step(s), {n_cols} column(s)) — paste straight into Excel.")
+
+    def export_depletion_table(self):
+        """Save exactly the table on screen, at full precision rather than
+        the rounded strings that are displayed."""
+        columns = getattr(self, '_dep_table_columns', None)
+        if not columns:
+            QMessageBox.warning(self, "Warning", "No depletion results are loaded.")
+            return
+        try:
+            df = pd.DataFrame({k: pd.Series(v) for k, v in columns.items()})
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Depletion Table",
+                os.path.join(os.getcwd(), "Depletion_Table.csv"), "CSV Files (*.csv)")
+            if save_path:
+                df.to_csv(save_path, index=False)
+                self._log(f"✅ Depletion table exported ({len(df)} step(s), "
+                          f"{len(df.columns)} column(s)) → {os.path.basename(save_path)}")
+                QMessageBox.information(
+                    self, "Success", f"Depletion table saved to:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
 
     def _plot_depletion_data(self):
         """Plot depletion, burnup, and isotope data"""
@@ -1134,6 +1915,7 @@ class ResultsPageWidget(QWidget):
 
     def process_statepoint(self, filepath):
         try:
+            self._loaded_path = filepath
             if self.sp is not None:
                 try:
                     self.sp.close()
@@ -1141,9 +1923,20 @@ class ResultsPageWidget(QWidget):
                     pass
             self.sp = None
 
-            if "depletion_results" in os.path.basename(filepath).lower():
+            self._refresh_result_file_combo(filepath)
+
+            if self._is_depletion_file(filepath):
                 self._process_depletion_results(filepath)
                 return
+
+            # An ordinary statepoint carries no depletion history, so the
+            # table below would otherwise keep showing the previous run's.
+            if hasattr(self, 'dep_group'):
+                self.dep_group.setVisible(False)
+                self.table_depletion.setRowCount(0)
+                self.table_depletion.setColumnCount(0)
+                self._dep_table_columns = {}
+                self._depletion_data = {}
 
             self.sp = openmc.StatePoint(filepath)
             try:
