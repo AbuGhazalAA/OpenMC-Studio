@@ -115,6 +115,14 @@ Switching **View** to *Nuclide inventory* keeps the same rows and replaces the k
 
 Everything in the table is copyable: **📋 Copy Whole Table** puts it on the clipboard as tab-separated text that pastes into Excel or OriginLab as proper cells, **Ctrl+C** (or **📋 Copy Selection**) copies just the selected block, and **💾 Export This Table (CSV)** saves it at full numerical precision. The line above the table summarises what was extracted — number of steps, time and burnup range, how k moved, and the burnup at which k crosses 1.
 
+#### Several result files in one folder
+
+A run leaves more than one `.h5` file behind: `depletion_results.h5` holds the complete burnup history, while `openmc_simulation_n0.h5`, `n1.h5`, … are ordinary statepoints, one per depletion step, each holding only that step's tallies. The whole table comes from the single depletion file — the per-step statepoints are not needed for it.
+
+The **Results file** dropdown at the top of the page lists every result file found in the working folder and its `export/` sub-folder, newest first, marked 🔥 for a depletion file (with its step count) or 📊 for a statepoint; picking one loads it, and **🔄** rescans the folder. Auto-loading after a run always prefers that run's depletion file.
+
+If the folder holds more than one depletion case, tick **Compare all depletion files in this folder** and the table shows them side by side — a block of time, burnup, k-effective and standard-deviation columns per case, in one copyable table. Rows are aligned on the step index, and each case keeps its own time and burnup columns, so cases run on different step grids stay distinguishable; a case with fewer steps leaves `n/a` in the rows it does not reach.
+
 ---
 
 ## 5. Running a Simulation
